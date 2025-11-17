@@ -1,6 +1,5 @@
 #ifndef UNICODE
 #define UNICODE
-#include <windows.h>
 #endif
 
 #ifndef _UNICODE
@@ -643,7 +642,8 @@ unsigned char* BitmapToMem(HBITMAP hbm, int width, int height) {
 }
 
 void DrawFrame_raw(unsigned int vao, GLuint shader) {
-  glClearColor(0.1, 0.1, 0.1, 1.0);  //? colorkey background
+  // todo 使用overlay窗口后，这里会有漏空的部分
+  glClearColor(0.01, 0.01, 0.01, 1.0);  //? colorkey background
   glClear(GL_COLOR_BUFFER_BIT);
   glUseProgram(shader);
 
