@@ -1,0 +1,3 @@
+build/
+.clangd
+.clang-format
