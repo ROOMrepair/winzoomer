@@ -19,7 +19,7 @@
 
 #define wheelScale 0.005
 #define scaleFriction 3.0
-#define rate 75.0
+#define rate 60.0
 #define miniScale 0.01
 #define radiusDeceleration 10.0
 #define dragFriction 6.0
@@ -153,7 +153,6 @@ COLORREF prevColor;
 POINT mouse_pos;
 POINT last_pos;
 TCHAR buf[BUF_SIZE] = {};
-char clicked;
 
 int virtualLeft, virtualTop, virtualWidth, virtualHeight;
 
@@ -161,8 +160,9 @@ FlashLight flashLight;
 Camera camera;
 
 bool isDragging;
-
 bool showDialog;
+char clicked;
+float dt;
 
 //& opengl
 HDC g_hdc = NULL;
@@ -171,6 +171,7 @@ GLuint screen_texture;
 GLuint screenVBO;
 GLuint screenVAO;
 GLuint screenEBO;
+GLuint shader;
 
 //& >>>>>>>>>>>> rect
 RECT rcRGB = {10, 40, 250, 60};
@@ -219,7 +220,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   wcex.hInstance = hInstance;
   wcex.hIcon = LoadIcon(NULL, IDI_APPLICATION);
   wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
-  wcex.hbrBackground = NULL;
+  wcex.hbrBackground = (HBRUSH)CreateSolidBrush(RGB(0, 0, 0));
   wcex.lpszMenuName = NULL;
   wcex.lpszClassName = WIN_CLASS_NAME;
   wcex.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
@@ -233,10 +234,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
   virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
-  overlay = CreateWindowEx(WS_EX_LAYERED | WS_EX_TOOLWINDOW, WIN_CLASS_NAME,
-                           L"", WS_POPUP, 0, 0, virtualWidth, virtualHeight,
-                           NULL, NULL, GetModuleHandle(NULL), NULL);
-  SetLayeredWindowAttributes(overlay, RGB(0, 0, 0), 0, LWA_COLORKEY);
+  overlay = CreateWindowEx(WS_EX_TOOLWINDOW, WIN_CLASS_NAME, L"", WS_POPUP, 0,
+                           0, virtualWidth, virtualHeight, NULL, NULL,
+                           GetModuleHandle(NULL), NULL);
+  // todo 怎么用 overlay 实现
+  // SetLayeredWindowAttributes(overlay, RGB(0, 0, 0), 0, LWA_COLORKEY);
   // SetLayeredWindowAttributes(overlay, 0, 255, LWA_ALPHA);
 
   dialog = CreateWindowEx(WS_EX_TOPMOST, WIN_CLASS_NAME, L"", WS_POPUP,
@@ -282,7 +284,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   // std::string vpath = std::string("./vert.glsl");
   // std::string fpath = std::string("./frag.glsl");
   // Shader shader(vpath.c_str(), fpath.c_str());
-  GLuint shader = createShader();
+  shader = createShader();
 
   glViewport(0, 0, virtualWidth, virtualHeight);
   glGenTextures(1, &screen_texture);
@@ -338,17 +340,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
   float ratio[2] = {(float)virtualWidth, (float)virtualHeight};
 
-  // shader.use();
-  // shader.setVec2(std::string("uResolution"), ratio);
-  // shader.setVec2(std::string("windowSize"), ratio);
-  // shader.setInt(std::string("uTexture"), 0);
   glUseProgram(shader);
   glUniform2fv(glGetUniformLocation(shader, "uResolution"), 1, ratio);
   glUniform2fv(glGetUniformLocation(shader, "windowSize"), 1, ratio);
   glUniform1f(glGetUniformLocation(shader, "uTexture"), 0);
 
-  float dt = 1 / rate;
-
+  dt = (float)1 / rate;
   SetTimer(overlay, REFRESH_TIMER_ID, 16, NULL);
 
   MSG msg = {};
@@ -373,10 +370,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
       TranslateMessage(&msg);
       DispatchMessage(&msg);
     }
-    camera.update(Vec2f(virtualWidth, virtualHeight), dt, isDragging);
-    flashLight.update(dt);
-    DrawFrame_raw(screenVAO, shader);
-    // DrawFrame(screenVAO, shader);
   }
 
   return 0;
@@ -448,12 +441,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
         float delta = wheelSpeed * wheelScale;
         if (flashLight.isEnabled && fwKeys & MK_SHIFT) {
           flashLight.deltaRadius +=
-              ((wheelSpeed > 0) ? 1 : -1) * INITIAL_FL_DELTA_RADIUS;
+              ((wheelSpeed > 0) ? -1 : 1) * INITIAL_FL_DELTA_RADIUS;
           return 0;
         }
         if (flashLight.isEnabled && fwKeys & MK_CONTROL) {
           flashLight.deltaRadius +=
-              ((wheelSpeed > 0) ? 1 : -1) * INITIAL_FL_DELTA_RADIUS;
+              ((wheelSpeed > 0) ? -1 : 1) * INITIAL_FL_DELTA_RADIUS;
         }
         camera.deltaScale += delta;
         camera.scalePivot = Vec2f((float)mouse_pos.x, (float)mouse_pos.y);
@@ -478,19 +471,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
 
         HDC hdc = BeginPaint(hwnd, &ps);
 
-        //?  离屏 DC
-        //?  但为了让它“立即可用”，Windows
-        //?  自动在里面塞了一张临时的、非常小的默认位图,oldbmp。
-        //?  例如在很多系统上它是一个 ?  1×1 像素的 monochrome bitmap。
         HDC memDC = CreateCompatibleDC(hdc);
         HBITMAP bmp =
             CreateCompatibleBitmap(hdc, ps.rcPaint.right, ps.rcPaint.bottom);
-        //? 替换内部的bitmap,返回原句柄
+
         HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, bmp);
 
         FillRect(memDC, &ps.rcPaint, (HBRUSH)(COLOR_WINDOW + 1));
 
-        //! draw start
         StringCchPrintf(buf, BUF_SIZE, _T("x=%ld y=%ld clicked:%c\n"), x, y,
                         clicked);
         DrawTextEx(memDC, buf, -1, &tip_rc, DT_LEFT | DT_TOP, NULL);
@@ -528,11 +516,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
         BitBlt(hdc, 0, 0, ps.rcPaint.right, ps.rcPaint.bottom, memDC, 0, 0,
                SRCCOPY);
 
-        //? 替换回去
         SelectObject(memDC, oldBmp);
         DeleteObject(bmp);
         DeleteDC(memDC);
-        //! draw end
+
         EndPaint(hwnd, &ps);
       }
       return 0;
@@ -557,24 +544,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
         prevColor = color;
       }
 
-      RedrawWindow(dialog, &tip_rc, NULL, RDW_INVALIDATE);
-      RedrawWindow(dialog, &tip_rc_2, NULL, RDW_INVALIDATE);
-      RedrawWindow(dialog, &tip_rc_3, NULL, RDW_INVALIDATE);
-      RedrawWindow(dialog, &tip_rc_4, NULL, RDW_INVALIDATE);
-      RedrawWindow(dialog, &rcRGB, NULL, RDW_INVALIDATE);
-      RedrawWindow(dialog, &rcHEX, NULL, RDW_INVALIDATE);
-      RedrawWindow(dialog, &rcHSV, NULL, RDW_INVALIDATE);
-      RedrawWindow(dialog, &rcColor, NULL, RDW_INVALIDATE);
-      return 0;
-    }
-    case WM_MOUSEMOVE: {
+      if (showDialog) {
+        RedrawWindow(dialog, &tip_rc, NULL, RDW_INVALIDATE);
+        RedrawWindow(dialog, &tip_rc_2, NULL, RDW_INVALIDATE);
+        RedrawWindow(dialog, &tip_rc_3, NULL, RDW_INVALIDATE);
+        RedrawWindow(dialog, &tip_rc_4, NULL, RDW_INVALIDATE);
+        RedrawWindow(dialog, &rcRGB, NULL, RDW_INVALIDATE);
+        RedrawWindow(dialog, &rcHEX, NULL, RDW_INVALIDATE);
+        RedrawWindow(dialog, &rcHSV, NULL, RDW_INVALIDATE);
+        RedrawWindow(dialog, &rcColor, NULL, RDW_INVALIDATE);
+      }
+
+      camera.update(Vec2f(virtualWidth, virtualHeight), dt, isDragging);
+      flashLight.update(dt);
+      DrawFrame_raw(screenVAO, shader);
+
       return 0;
     }
     case WM_ERASEBKGND: {
       return 1;
-    }
-    case WM_DPICHANGED: {
-      return 0;
     }
   }
   return DefWindowProc(hwnd, uMsg, wParam, lParam);
@@ -643,7 +631,7 @@ unsigned char* BitmapToMem(HBITMAP hbm, int width, int height) {
 
 void DrawFrame_raw(unsigned int vao, GLuint shader) {
   // todo 使用overlay窗口后，这里会有漏空的部分
-  glClearColor(0.01, 0.01, 0.01, 1.0);  //? colorkey background
+  glClearColor(0.1, 0.1, 0.1, 1);  //? colorkey background
   glClear(GL_COLOR_BUFFER_BIT);
   glUseProgram(shader);
 
