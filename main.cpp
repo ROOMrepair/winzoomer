@@ -1,20 +1,22 @@
-#ifndef UNICODE
-#define UNICODE
-#endif
-
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-
 #include <cassert>
+#include <cstdio>
+#include <string>
+#include <libloaderapi.h>
 #include <tchar.h>
 #include <strsafe.h>
 #include <windowsx.h>
 #include <math.h>
 #include <ShellScalingApi.h>
-#include "shader.hpp"
 
-#define BUF_SIZE 512
+#ifdef FREETYPE
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include <map>
+#endif
+
+#include <glad/glad.h>
+
+#define BUF_SIZE 1024
 #define REFRESH_TIMER_ID 1
 
 #define wheelScale 0.005
@@ -33,28 +35,39 @@
 const wchar_t WIN_CLASS_NAME[] = _T("WHAT_8MTfo7IzrQ");
 const wchar_t MUTEX_NAME[] = _T("WHAT_1JzKDIayja");
 
-typedef struct Vec2f {
-  float x;
-  float y;
-  Vec2f() : x(0), y(0) {}
-  Vec2f(float _x, float _y) : x(_x), y(_y) {}
-  Vec2f operator+(const float s) { return Vec2f(x + s, y + s); }
-  Vec2f operator-(const float s) { return Vec2f(x - s, y - s); }
-  Vec2f operator-(const Vec2f other) { return Vec2f(x - other.x, y - other.y); }
-  Vec2f operator*(const float s) { return Vec2f(x * s, y * s); }
-  Vec2f operator/(const float s) { return Vec2f(x / s, y / s); }
-  Vec2f& operator+=(const Vec2f v) {
+template <typename T>
+struct Vec2 {
+  T x, y;
+  Vec2() : x(0), y(0) {}
+  Vec2(T _x, T _y) : x(_x), y(_y) {}
+  Vec2 operator+(const T& s) { return Vec2(x + s, y + s); }
+  Vec2 operator-(const T& s) { return Vec2(x - s, y - s); }
+  Vec2 operator-(const Vec2& other) { return Vec2(x - other.x, y - other.y); }
+  Vec2 operator*(const T& s) { return Vec2(x * s, y * s); }
+  Vec2 operator/(const T& s) { return Vec2(x / s, y / s); }
+  Vec2& operator+=(const Vec2& v) {
     this->x += v.x;
     this->y += v.y;
     return *this;
   }
-  Vec2f& operator-=(const Vec2f v) {
+  Vec2& operator-=(const Vec2& v) {
     this->x -= v.x;
     this->y -= v.y;
     return *this;
   }
-  float length() { return sqrt(x * x + y * y); }
-} Vec2f;
+  float length() { return static_cast<T>(sqrt(x * x + y * y)); }
+};
+
+template <typename T>
+struct Vec3 {
+  Vec3(T _x, T _y, T _z) : x(_x), y(_y), z(_z) {}
+  T x, y, z;
+};
+
+typedef Vec2<float> Vec2f;
+typedef Vec2<int> Vec2i;
+typedef Vec3<int> Vec3i;
+typedef Vec3<float> Vec3f;
 
 typedef struct FlashLight {
   bool isEnabled;
@@ -95,6 +108,37 @@ typedef struct Camera {
     }
   }
 } Camera;
+
+#ifdef FREETYPE
+struct Character {
+  GLuint TextureID;  // 字形纹理的ID
+  Vec2i Size;        // 字形大小
+  Vec2i Bearing;     // 从基准线到字形左部/顶部的偏移值
+  FT_Pos Advance;    // 原点距下一个字形原点的距离
+};
+#endif
+
+struct Mat4 {
+  float m[16];  // 列主序
+
+  static Mat4 identity() {
+    Mat4 r = {};
+    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
+    return r;
+  }
+};
+Mat4 ortho(float left, float right, float bottom, float top) {
+  Mat4 r = {};
+
+  r.m[0] = 2.0f / (right - left);
+  r.m[5] = 2.0f / (top - bottom);
+  r.m[10] = -1.0f;
+  r.m[12] = -(right + left) / (right - left);
+  r.m[13] = -(top + bottom) / (top - bottom);
+  r.m[15] = 1.0f;
+
+  return r;
+}
 
 std::string vertexShader = R"(
 #version 330 core
@@ -146,13 +190,41 @@ void main()
 }
 )";
 
+std::string textVertShader = R"(
+#version 330 core
+layout (location = 0) in vec4 vertex; // <vec2 pos, vec2 tex>
+out vec2 TexCoords;
+
+uniform mat4 projection;
+
+void main()
+{
+    gl_Position = projection * vec4(vertex.xy, 0.0, 1.0);
+    TexCoords = vertex.zw;
+}
+)";
+
+std::string textfragmentShader = R"(
+#version 330 core
+in vec2 TexCoords;
+out vec4 color;
+
+uniform sampler2D text;
+uniform vec3 textColor;
+
+void main()
+{
+    vec4 sampled = vec4(1.0, 1.0, 1.0, texture(text, TexCoords).r);
+    color = vec4(textColor, 1.0) * sampled;
+}
+
+)";
+
 //& >>>>>>>>>>>> state
-HWND overlay, dialog;
+HWND overlay;
 COLORREF color;
-COLORREF prevColor;
 POINT mouse_pos;
 POINT last_pos;
-TCHAR buf[BUF_SIZE] = {};
 
 int virtualLeft, virtualTop, virtualWidth, virtualHeight;
 
@@ -160,37 +232,52 @@ FlashLight flashLight;
 Camera camera;
 
 bool isDragging;
-bool showDialog;
-char clicked;
 float dt;
+
+#ifdef FREETYPE
+std::map<GLchar, Character> Characters;
+FT_UInt pixel_height = 16;
+GLuint textVAO, textVBO;
+GLuint shader_txt;
+#endif
 
 //& opengl
 HDC g_hdc = NULL;
 HGLRC g_glrc = NULL;
+GLuint shader_img;
 GLuint screen_texture;
-GLuint screenVBO;
-GLuint screenVAO;
-GLuint screenEBO;
-GLuint shader;
+GLuint screenVBO, screenVAO, screenEBO;
 
-//& >>>>>>>>>>>> rect
-RECT rcRGB = {10, 40, 250, 60};
-RECT rcHEX = {10, 60, 250, 80};
-RECT rcHSV = {10, 80, 250, 100};
-RECT tip_rc = {10, 100, 300, 150};
-RECT tip_rc_2 = {10, 150, 300, 200};
-RECT tip_rc_3 = {10, 200, 500, 250};
-RECT tip_rc_4 = {10, 250, 600, 300};
-RECT rcColor = {220, 20, 300, 80};
-RECT dialogWindow = {0, 0, 400, 300};
 //& >>>>>>>>>>>> function
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
-void RGBtoHSV(int r, int g, int b, double& h, double& s, double& v);
+void checkCompileErrors(GLuint shader, const std::string& type);
+void RGBtoHSV(int r, int g, int b, float& h, float& s, float& v);
 HBITMAP CaptureScreenToBitmap(int width, int height);
 unsigned char* BitmapToMem(HBITMAP hbm, int width, int height);
-void DrawFrame(unsigned int vao, Shader& shader);
-void DrawFrame_raw(unsigned int vao, GLuint shader);
-GLuint createShader();
+
+GLuint createShader(std::string& vert, std::string& frag);
+void RenderScreen_raw();
+#ifdef FREETYPE
+void RenderText(std::string& text, GLfloat x, GLfloat y, GLfloat scale,
+                Vec3f color);
+#endif
+
+void RenderBegin() {
+  glViewport(0, 0, virtualWidth, virtualHeight);
+  // todo 使用overlay窗口后，这里会有漏空的部分
+  glClearColor(0.1, 0.1, 0.1, 1);  //? colorkey background
+  glClear(GL_COLOR_BUFFER_BIT);
+}
+
+void RenderEnd() { SwapBuffers(g_hdc); }
+
+// Source - https://stackoverflow.com/a/24386991
+// Posted by Pixelchemist
+// Retrieved 2025-11-19, License - CC BY-SA 3.0
+template <class T>
+T file_path(T const& path, T const& delims = "/\\") {
+  return path.substr(0, path.find_last_of(delims));
+}
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                     LPWSTR pCmdLine, int nCmdShow) {
@@ -202,14 +289,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
       if (handle != NULL) {
         ShowWindow(handle, SW_SHOWNORMAL);
         SetForegroundWindow(handle);
-        return FALSE;
+        return false;
       }
     }
   } else {
-    StringCchPrintf(buf, BUF_SIZE, _T("程序运行错误: %lu\n"), GetLastError());
-    MessageBox(NULL, buf, _T("提示"), MB_OK);
-    return FALSE;
+    MessageBox(NULL, _T("failed to execuate program"), _T("Error"), MB_OK);
+    return false;
   }
+
+  virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
   WNDCLASSEX wcex;
   wcex.cbSize = sizeof(wcex);
@@ -229,36 +320,32 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
   RegisterHotKey(NULL, 1, MOD_CONTROL | MOD_SHIFT, VK_F12);
 
-  virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-  virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
-  virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-  virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-
-  overlay = CreateWindowEx(WS_EX_TOOLWINDOW, WIN_CLASS_NAME, L"", WS_POPUP, 0,
-                           0, virtualWidth, virtualHeight, NULL, NULL,
+  overlay = CreateWindowEx(WS_EX_TOPMOST, WIN_CLASS_NAME, L"", WS_POPUP, 0, 0,
+                           virtualWidth, virtualHeight, NULL, NULL,
                            GetModuleHandle(NULL), NULL);
   // todo 怎么用 overlay 实现
   // SetLayeredWindowAttributes(overlay, RGB(0, 0, 0), 0, LWA_COLORKEY);
   // SetLayeredWindowAttributes(overlay, 0, 255, LWA_ALPHA);
 
-  dialog = CreateWindowEx(WS_EX_TOPMOST, WIN_CLASS_NAME, L"", WS_POPUP,
-                          UNFOLD_RECT_XYWH(dialogWindow), NULL, NULL, hInstance,
-                          NULL);
-
-  if (overlay == NULL || dialog == NULL) {
-    return 0;
+  if (overlay == NULL) {
+    MessageBox(NULL, _T("fail to create window failed"), _T("Error"), MB_OK);
+    return 1;
   }
 
   ShowWindow(overlay, nCmdShow);
+  SetWindowPos(overlay, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+  SetFocus(overlay);
 
-  showDialog = false;
   camera.scale = 1.0f;
   camera.deltaScale = 0.0f;
   flashLight.radius = 100.0f;
   flashLight.deltaRadius = 0.0f;
   flashLight.isEnabled = false;
+  dt = (float)1 / rate;
 
-  //& <<<<< init opengl
+  SetTimer(overlay, REFRESH_TIMER_ID, 16, NULL);
+
+  //& <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< init opengl
   g_hdc = GetDC(overlay);
   PIXELFORMATDESCRIPTOR pfd = {sizeof(PIXELFORMATDESCRIPTOR)};
   pfd.nVersion = 1;
@@ -276,17 +363,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   wglMakeCurrent(g_hdc, g_glrc);
 
   if (!gladLoadGL()) {
-    MessageBox(NULL, L"gladLoadGL() failed", L"Error", MB_OK);
+    MessageBox(NULL, _T("failed to run gladLoadGL"), _T("Error"), MB_OK);
     return false;
   }
-  //& >>>>> init opengl
 
-  // std::string vpath = std::string("./vert.glsl");
-  // std::string fpath = std::string("./frag.glsl");
-  // Shader shader(vpath.c_str(), fpath.c_str());
-  shader = createShader();
+  shader_img = createShader(vertexShader, fragmentShader);
 
-  glViewport(0, 0, virtualWidth, virtualHeight);
   glGenTextures(1, &screen_texture);
   glGenBuffers(1, &screenVBO);
   glGenVertexArrays(1, &screenVAO);
@@ -323,7 +405,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   auto hbitmap = CaptureScreenToBitmap(virtualWidth, virtualHeight);
   auto data = BitmapToMem(hbitmap, virtualWidth, virtualHeight);
 
-  glActiveTexture(GL_TEXTURE0);
+  // glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, screen_texture);
 
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, virtualWidth, virtualHeight, 0,
@@ -335,18 +417,93 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
 
+  glBindTexture(GL_TEXTURE_2D, 0);  // 解绑
+  glBindVertexArray(0);             // 解绑
+
   DeleteObject(hbitmap);
   delete data;
 
+  // these may not be modified
   float ratio[2] = {(float)virtualWidth, (float)virtualHeight};
+  glUseProgram(shader_img);
+  glUniform2fv(glGetUniformLocation(shader_img, "uResolution"), 1, ratio);
+  glUniform2fv(glGetUniformLocation(shader_img, "windowSize"), 1, ratio);
 
-  glUseProgram(shader);
-  glUniform2fv(glGetUniformLocation(shader, "uResolution"), 1, ratio);
-  glUniform2fv(glGetUniformLocation(shader, "windowSize"), 1, ratio);
-  glUniform1f(glGetUniformLocation(shader, "uTexture"), 0);
+#ifdef FREETYPE
+  //& for text
+  // https://learnopengl-cn.github.io/06%20In%20Practice/02%20Text%20Rendering/
+  char pathBuf[BUF_SIZE] = {};
+  GetModuleFileNameA(NULL, pathBuf, BUF_SIZE);
+  std::string path(pathBuf);
 
-  dt = (float)1 / rate;
-  SetTimer(overlay, REFRESH_TIMER_ID, 16, NULL);
+  auto exePath = file_path(path);
+  auto fontPath = file_path(exePath) + "\\fonts\\Px437_Acer_VGA_8x8.ttf";
+  FT_Library ft;
+  FT_Face face;
+
+  if (FT_Init_FreeType(&ft)) {
+    MessageBox(NULL, _T("ERROR::FREETYPE: Could not init FreeType Library"),
+               _T("message"), MB_OK);
+    return 1;
+  }
+  if (FT_New_Face(ft, fontPath.c_str(), 0, &face)) {
+    MessageBoxA(NULL, fontPath.c_str(), "failed to load font", MB_OK);
+    return 1;
+  }
+
+  FT_Set_Pixel_Sizes(face, 0, pixel_height);
+
+  shader_txt = createShader(textVertShader, textfragmentShader);
+
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);  // 禁用字节对齐限制
+
+  for (GLubyte c = 0; c < 128; c++) {
+    if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
+      continue;
+    }
+
+    GLuint txture;
+    glGenTextures(1, &txture);
+    glBindTexture(GL_TEXTURE_2D, txture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, face->glyph->bitmap.width,
+                 face->glyph->bitmap.rows, 0, GL_RED, GL_UNSIGNED_BYTE,
+                 face->glyph->bitmap.buffer);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    Character character = {
+        txture, Vec2i(face->glyph->bitmap.width, face->glyph->bitmap.rows),
+        Vec2i(face->glyph->bitmap_left, face->glyph->bitmap_top),
+        face->glyph->advance.x};
+
+    Characters.insert(std::pair<GLchar, Character>(c, character));
+  }
+
+  glBindTexture(GL_TEXTURE_2D, 0);  // 解绑
+
+  FT_Done_Face(face);
+  FT_Done_FreeType(ft);
+
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  glGenVertexArrays(1, &textVAO);
+  glGenBuffers(1, &textVBO);
+
+  glBindVertexArray(textVAO);
+  glBindBuffer(GL_ARRAY_BUFFER, textVBO);
+  glBufferData(GL_ARRAY_BUFFER, sizeof(GLfloat) * 6 * 4, NULL, GL_DYNAMIC_DRAW);
+
+  glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), 0);
+  glEnableVertexAttribArray(0);
+
+  glBindVertexArray(0);  // 解绑
+
+#endif
+  //& >>>>>>>>>>>>>>>>>>>>>>>>>>>>>> init opengl
 
   MSG msg = {};
   while (true) {
@@ -360,10 +517,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         glDeleteBuffers(1, &screenVBO);
         glDeleteBuffers(1, &screenEBO);
         glDeleteVertexArrays(1, &screenVAO);
+
+#ifdef FREETYPE
+        glDeleteBuffers(1, &textVBO);
+        glDeleteVertexArrays(1, &textVAO);
+#endif
+
         return 0;
       }
       if (msg.message == WM_HOTKEY && msg.wParam == 1) {
-        KillTimer(dialog, REFRESH_TIMER_ID);
         PostQuitMessage(0);
         continue;
       }
@@ -386,142 +548,56 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
       return 0;
     }
     case WM_KEYUP: {
-      if (hwnd == overlay) {
-        switch (wParam) {
-          case 'F':
-            clicked = 'F';
-            flashLight.isEnabled = !flashLight.isEnabled;
-            break;
-          case 'R':
-            clicked = 'R';
-            camera.scale = 1.0f;
-            camera.deltaScale = 0.0f;
-            camera.position = Vec2f(0.0f, 0.0f);
-            camera.velocity = Vec2f(0.0f, 0.0f);
+      switch (wParam) {
+        case 'F':
+          flashLight.isEnabled = !flashLight.isEnabled;
+          break;
+        case 'R':
+          camera.scale = 1.0f;
+          camera.deltaScale = 0.0f;
+          camera.position = Vec2f(0.0f, 0.0f);
+          camera.velocity = Vec2f(0.0f, 0.0f);
 
-            flashLight.radius = 100.0f;
-            flashLight.deltaRadius = 0.0f;
-            flashLight.isEnabled = false;
-            showDialog = false;
-            ShowWindow(dialog, SW_HIDE);
-            SetFocus(overlay);
-            break;
-          case 'S':
-            clicked = 'S';
-            showDialog = !showDialog;
-            if (showDialog) {
-              ShowWindow(dialog, SW_SHOW);
-            } else {
-              ShowWindow(dialog, SW_HIDE);
-            }
-            SetFocus(overlay);
-            break;
-          default:
-            break;
-        }
+          flashLight.radius = 100.0f;
+          flashLight.deltaRadius = 0.0f;
+          flashLight.isEnabled = false;
+          SetFocus(overlay);
+          break;
+        default:
+          break;
       }
       return 0;
     }
     case WM_LBUTTONDOWN: {
-      if (hwnd == overlay) {
-        isDragging = true;
-      }
+      isDragging = true;
       return 0;
     }
     case WM_LBUTTONUP: {
-      if (hwnd == overlay) {
-        isDragging = false;
-      }
+      isDragging = false;
       return 0;
     }
     case WM_MOUSEWHEEL: {
-      if (hwnd == overlay) {
-        auto wheelSpeed = GET_WHEEL_DELTA_WPARAM(wParam);
-        auto fwKeys = GET_KEYSTATE_WPARAM(wParam);
-        float delta = wheelSpeed * wheelScale;
-        if (flashLight.isEnabled && fwKeys & MK_SHIFT) {
-          flashLight.deltaRadius +=
-              ((wheelSpeed > 0) ? -1 : 1) * INITIAL_FL_DELTA_RADIUS;
-          return 0;
-        }
-        if (flashLight.isEnabled && fwKeys & MK_CONTROL) {
-          flashLight.deltaRadius +=
-              ((wheelSpeed > 0) ? -1 : 1) * INITIAL_FL_DELTA_RADIUS;
-        }
-        camera.deltaScale += delta;
-        camera.scalePivot = Vec2f((float)mouse_pos.x, (float)mouse_pos.y);
+      auto wheelSpeed = GET_WHEEL_DELTA_WPARAM(wParam);
+      auto fwKeys = GET_KEYSTATE_WPARAM(wParam);
+      float delta = wheelSpeed * wheelScale;
+      if (flashLight.isEnabled && fwKeys & MK_SHIFT) {
+        flashLight.deltaRadius +=
+            ((wheelSpeed > 0) ? 1 : -1) * INITIAL_FL_DELTA_RADIUS;
+        return 0;
       }
+      if (flashLight.isEnabled && fwKeys & MK_CONTROL) {
+        flashLight.deltaRadius +=
+            ((wheelSpeed > 0) ? 1 : -1) * INITIAL_FL_DELTA_RADIUS;
+      }
+      camera.deltaScale += delta;
+      camera.scalePivot = Vec2f((float)mouse_pos.x, (float)mouse_pos.y);
       return 0;
     }
     case WM_PAINT: {
       PAINTSTRUCT ps;
-      if (hwnd == overlay) {
-        //! 这里必须要手动绘制一下，不然peekmessage不会处理wm_paint事件
-        BeginPaint(hwnd, &ps);
-        EndPaint(hwnd, &ps);
-      }
-      if (hwnd == dialog) {
-        // BeginPaint(hwnd, &ps);
-        // EndPaint(hwnd, &ps);
-        auto x = mouse_pos.x;
-        auto y = mouse_pos.y;
-        auto r = GetRValue(color);
-        auto g = GetGValue(color);
-        auto b = GetBValue(color);
-
-        HDC hdc = BeginPaint(hwnd, &ps);
-
-        HDC memDC = CreateCompatibleDC(hdc);
-        HBITMAP bmp =
-            CreateCompatibleBitmap(hdc, ps.rcPaint.right, ps.rcPaint.bottom);
-
-        HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, bmp);
-
-        FillRect(memDC, &ps.rcPaint, (HBRUSH)(COLOR_WINDOW + 1));
-
-        StringCchPrintf(buf, BUF_SIZE, _T("x=%ld y=%ld clicked:%c\n"), x, y,
-                        clicked);
-        DrawTextEx(memDC, buf, -1, &tip_rc, DT_LEFT | DT_TOP, NULL);
-
-        StringCchPrintf(buf, BUF_SIZE, _T("winsize x=%d y=%d w=%d h=%d\n"),
-                        virtualLeft, virtualTop, virtualWidth, virtualHeight);
-        DrawTextEx(memDC, buf, -1, &tip_rc_2, DT_LEFT | DT_TOP, NULL);
-
-        StringCchPrintf(buf, BUF_SIZE, _T("flashlight:%d fldelta:%.2f\n"),
-                        flashLight.isEnabled, flashLight.deltaRadius);
-        DrawTextEx(memDC, buf, -1, &tip_rc_3, DT_LEFT | DT_TOP, NULL);
-
-        StringCchPrintf(buf, BUF_SIZE,
-                        _T("camera scale:%.2f dscale:%.2f x:%.2f y:%.2f\n"),
-                        camera.scale, camera.deltaScale, camera.position.x,
-                        camera.position.y);
-        DrawTextEx(memDC, buf, -1, &tip_rc_4, DT_LEFT | DT_TOP, NULL);
-
-        StringCchPrintf(buf, BUF_SIZE, _T("RGB:(%d,%d,%d)\n"), r, g, b);
-        DrawTextEx(memDC, buf, -1, &rcRGB, DT_LEFT | DT_TOP, NULL);
-
-        StringCchPrintf(buf, 128, _T("HEX: #%02X%02X%02X"), r, g, b);
-        DrawText(memDC, buf, -1, &rcHEX, DT_LEFT | DT_TOP);
-
-        double h, s, v;
-        RGBtoHSV(r, g, b, h, s, v);
-        StringCchPrintf(buf, 128, _T("HSV: (%.0f°, %.0f%%, %.0f%%)"), h,
-                        s * 100, v * 100);
-        DrawText(memDC, buf, -1, &rcHSV, DT_LEFT | DT_TOP);
-
-        HBRUSH hBrush = CreateSolidBrush(RGB(r, g, b));
-        FillRect(memDC, &rcColor, hBrush);
-        DeleteBrush(hBrush);
-
-        BitBlt(hdc, 0, 0, ps.rcPaint.right, ps.rcPaint.bottom, memDC, 0, 0,
-               SRCCOPY);
-
-        SelectObject(memDC, oldBmp);
-        DeleteObject(bmp);
-        DeleteDC(memDC);
-
-        EndPaint(hwnd, &ps);
-      }
+      //! 这里必须要手动绘制一下，不然peekmessage不会处理wm_paint事件
+      BeginPaint(hwnd, &ps);
+      EndPaint(hwnd, &ps);
       return 0;
     }
     case WM_TIMER: {
@@ -540,24 +616,51 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
         last_pos.x = mouse_pos.x;
         last_pos.y = mouse_pos.y;
       }
-      if (color != prevColor) {
-        prevColor = color;
-      }
-
-      if (showDialog) {
-        RedrawWindow(dialog, &tip_rc, NULL, RDW_INVALIDATE);
-        RedrawWindow(dialog, &tip_rc_2, NULL, RDW_INVALIDATE);
-        RedrawWindow(dialog, &tip_rc_3, NULL, RDW_INVALIDATE);
-        RedrawWindow(dialog, &tip_rc_4, NULL, RDW_INVALIDATE);
-        RedrawWindow(dialog, &rcRGB, NULL, RDW_INVALIDATE);
-        RedrawWindow(dialog, &rcHEX, NULL, RDW_INVALIDATE);
-        RedrawWindow(dialog, &rcHSV, NULL, RDW_INVALIDATE);
-        RedrawWindow(dialog, &rcColor, NULL, RDW_INVALIDATE);
-      }
 
       camera.update(Vec2f(virtualWidth, virtualHeight), dt, isDragging);
       flashLight.update(dt);
-      DrawFrame_raw(screenVAO, shader);
+
+      RenderBegin();
+      RenderScreen_raw();
+
+#ifdef FREETYPE
+      if (flashLight.isEnabled) {
+        // auto x = mouse_pos.x;
+        // auto y = mouse_pos.y;
+        auto r = GetRValue(color);
+        auto g = GetGValue(color);
+        auto b = GetBValue(color);
+        float h, s, v;
+        RGBtoHSV(r, g, b, h, s, v);
+        int sz;
+        sz = std::snprintf(nullptr, 0, "RGB: %d %d %d", r, g, b);
+        std::string textbuf(sz + 1, '\0');
+        std::sprintf(textbuf.data(), "RGB: %d %d %d", r, g, b);
+        float tx = 25.0f;
+        float ty = 20.0f;
+        float scale = 1.0f;
+        float padding = pixel_height * scale * 2;
+
+        // Vec3f(r / 255.0f, g / 255.0f, b / 255.0f)
+        RenderText(textbuf, tx, ty, scale, Vec3f(0.5, 0.8f, 0.2f));
+
+        sz = std::snprintf(nullptr, 0, "HEX: #%02X%02X%02X", r, g, b);
+        textbuf.resize(sz + 1);
+        std::sprintf(textbuf.data(), "HEX: #%02X%02X%02X", r, g, b);
+
+        ty += padding;
+        RenderText(textbuf, tx, ty, scale, Vec3f(0.5, 0.8f, 0.2f));
+
+        sz = std::snprintf(nullptr, 0, "HSV: (%.0f°, %.0f%%, %.0f%%)", h,
+                           s * 100, v * 100);
+        textbuf.resize(sz + 1);
+        std::sprintf(textbuf.data(), "HSV: (%.0f°, %.0f%%, %.0f%%)", h, s * 100,
+                     v * 100);
+        ty += padding;
+        RenderText(textbuf, tx, ty, scale, Vec3f(0.5, 0.8f, 0.2f));
+      }
+#endif
+      RenderEnd();
 
       return 0;
     }
@@ -568,14 +671,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
   return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-void RGBtoHSV(int r, int g, int b, double& h, double& s, double& v) {
-  double rd = r / 255.0;
-  double gd = g / 255.0;
-  double bd = b / 255.0;
+void RGBtoHSV(int r, int g, int b, float& h, float& s, float& v) {
+  float rd = r / 255.0;
+  float gd = g / 255.0;
+  float bd = b / 255.0;
 
-  double maxv = fmax(rd, fmax(gd, bd));
-  double minv = fmin(rd, fmin(gd, bd));
-  double delta = maxv - minv;
+  float maxv = fmax(rd, fmax(gd, bd));
+  float minv = fmin(rd, fmin(gd, bd));
+  float delta = maxv - minv;
 
   if (delta < 1e-6)
     h = 0;
@@ -629,50 +732,6 @@ unsigned char* BitmapToMem(HBITMAP hbm, int width, int height) {
   return data;
 }
 
-void DrawFrame_raw(unsigned int vao, GLuint shader) {
-  // todo 使用overlay窗口后，这里会有漏空的部分
-  glClearColor(0.1, 0.1, 0.1, 1);  //? colorkey background
-  glClear(GL_COLOR_BUFFER_BIT);
-  glUseProgram(shader);
-
-  float cameraPos[2] = {camera.position.x, camera.position.y};
-  float mousePos[2] = {(float)mouse_pos.x, (float)mouse_pos.y};
-
-  glUniform1f(glGetUniformLocation(shader, "cameraScale"), camera.scale);
-  glUniform1f(glGetUniformLocation(shader, "flShadow"), flashLight.shadow);
-  glUniform1f(glGetUniformLocation(shader, "flRadius"), flashLight.radius);
-
-  glUniform2fv(glGetUniformLocation(shader, "cameraPos"), 1, cameraPos);
-  glUniform2fv(glGetUniformLocation(shader, "mousePos"), 1, mousePos);
-
-  glBindVertexArray(vao);
-  glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT,
-                 (void*)(0 * sizeof(unsigned int)));
-
-  SwapBuffers(g_hdc);
-}
-
-void DrawFrame(unsigned int vao, Shader& shader) {
-  glClearColor(0.1, 0.1, 0.1, 1.0);  //? colorkey background
-  glClear(GL_COLOR_BUFFER_BIT);
-  shader.use();
-
-  float cameraPos[2] = {camera.position.x, camera.position.y};
-  float mousePos[2] = {(float)mouse_pos.x, (float)mouse_pos.y};
-  shader.setFloat("cameraScale", camera.scale);
-  shader.setVec2("cameraPos", cameraPos);
-  shader.setVec2("mousePos", mousePos);
-
-  shader.setFloat("flShadow", flashLight.shadow);
-  shader.setFloat("flRadius", flashLight.radius);
-
-  glBindVertexArray(vao);
-  glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT,
-                 (void*)(0 * sizeof(unsigned int)));
-
-  SwapBuffers(g_hdc);
-}
-
 void checkCompileErrors(GLuint shader, const std::string& type) {
   GLint success;
   char infoLog[2048];
@@ -701,17 +760,17 @@ void checkCompileErrors(GLuint shader, const std::string& type) {
   }
 }
 
-GLuint createShader() {
+GLuint createShader(std::string& vert, std::string& frag) {
   GLuint vertex, fragment;
   // vertex shader
   vertex = glCreateShader(GL_VERTEX_SHADER);
-  const char* vertSrc = vertexShader.c_str();
+  const char* vertSrc = vert.c_str();
   glShaderSource(vertex, 1, &vertSrc, NULL);
   glCompileShader(vertex);
 
   checkCompileErrors(vertex, "VERTEX");
   // fragment Shader
-  const char* fragSrc = fragmentShader.c_str();
+  const char* fragSrc = frag.c_str();
   fragment = glCreateShader(GL_FRAGMENT_SHADER);
   glShaderSource(fragment, 1, &fragSrc, NULL);
   glCompileShader(fragment);
@@ -729,3 +788,84 @@ GLuint createShader() {
   glDeleteShader(fragment);
   return ID;
 }
+
+void RenderScreen_raw() {
+  // draw screen
+  glUseProgram(shader_img);
+
+  glActiveTexture(GL_TEXTURE0);
+  glBindVertexArray(screenVAO);
+  glBindTexture(GL_TEXTURE_2D, screen_texture);
+
+  float cameraPos[2] = {camera.position.x, camera.position.y};
+  float mousePos[2] = {(float)mouse_pos.x, (float)mouse_pos.y};
+
+  glUniform1f(glGetUniformLocation(shader_img, "cameraScale"), camera.scale);
+  glUniform1f(glGetUniformLocation(shader_img, "flShadow"), flashLight.shadow);
+  glUniform1f(glGetUniformLocation(shader_img, "flRadius"), flashLight.radius);
+
+  glUniform2fv(glGetUniformLocation(shader_img, "cameraPos"), 1, cameraPos);
+  glUniform2fv(glGetUniformLocation(shader_img, "mousePos"), 1, mousePos);
+  glUniform1i(glGetUniformLocation(shader_img, "uTexture"), 0);
+
+  glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT,
+                 (void*)(0 * sizeof(unsigned int)));
+
+  glBindVertexArray(0);             // 解绑
+  glBindTexture(GL_TEXTURE_2D, 0);  // 解绑
+}
+
+#ifdef FREETYPE
+void RenderText(std::string& text, GLfloat x, GLfloat y, GLfloat scale,
+                Vec3f color) {
+  // 激活对应的渲染状态
+  glUseProgram(shader_txt);
+
+  glActiveTexture(GL_TEXTURE0);
+  glBindVertexArray(textVAO);
+  Mat4 projection = ortho(0, virtualWidth, 0, virtualHeight);
+
+  glUniform1i(glGetUniformLocation(shader_txt, "text"), 0);
+  glUniform3f(glGetUniformLocation(shader_txt, "textColor"), color.x, color.y,
+              color.z);
+  glUniformMatrix4fv(glGetUniformLocation(shader_txt, "projection"), 1,
+                     GL_FALSE, projection.m);
+
+  // 遍历文本中所有的字符
+  std::string::const_iterator c;
+  for (c = text.begin(); c != text.end(); c++) {
+    Character ch = Characters[*c];
+
+    GLfloat xpos = x + ch.Bearing.x * scale;
+    GLfloat ypos = y - (ch.Size.y - ch.Bearing.y) * scale;
+
+    GLfloat w = ch.Size.x * scale;
+    GLfloat h = ch.Size.y * scale;
+
+    // 对每个字符更新VBO
+    // clang-format off
+    GLfloat vertices[6][4] = {
+        {xpos, ypos + h, 0.0, 0.0},
+        {xpos, ypos, 0.0, 1.0},
+        {xpos + w, ypos, 1.0, 1.0},
+        {xpos, ypos + h, 0.0, 0.0},
+        {xpos + w, ypos, 1.0, 1.0},
+        {xpos + w, ypos + h, 1.0, 0.0}};
+    // clang-format on
+
+    // 在四边形上绘制字形纹理
+    glBindTexture(GL_TEXTURE_2D, ch.TextureID);
+    // 更新VBO内存的内容
+    glBindBuffer(GL_ARRAY_BUFFER, textVBO);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    // 绘制四边形
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    // 更新位置到下一个字形的原点，注意单位是1/64像素
+    x += (ch.Advance >> 6) *
+         scale;  // 位偏移6个单位来获取单位为像素的值 (2^6 = 64)
+  }
+  glBindVertexArray(0);
+  glBindTexture(GL_TEXTURE_2D, 0);
+}
+#endif
