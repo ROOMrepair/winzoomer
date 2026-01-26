@@ -29,9 +29,6 @@
 #define VELOCITY_THRESHOLD 15.0
 #define INITIAL_FL_DELTA_RADIUS 250.0
 
-#define UNFOLD_RECT_XYWH(rect) \
-  rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
-
 const wchar_t WIN_CLASS_NAME[] = _T("WHAT_8MTfo7IzrQ");
 const wchar_t MUTEX_NAME[] = _T("WHAT_1JzKDIayja");
 
@@ -127,6 +124,7 @@ struct Mat4 {
     return r;
   }
 };
+
 Mat4 ortho(float left, float right, float bottom, float top) {
   Mat4 r = {};
 
@@ -264,8 +262,7 @@ void RenderText(std::string& text, GLfloat x, GLfloat y, GLfloat scale,
 
 void RenderBegin() {
   glViewport(0, 0, virtualWidth, virtualHeight);
-  // todo 使用overlay窗口后，这里会有漏空的部分
-  glClearColor(0.1, 0.1, 0.1, 1);  //? colorkey background
+  glClearColor(0.1, 0.1, 0.1, 1);
   glClear(GL_COLOR_BUFFER_BIT);
 }
 
@@ -293,7 +290,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
       }
     }
   } else {
-    MessageBox(NULL, _T("failed to execuate program"), _T("Error"), MB_OK);
+    MessageBoxA(NULL, "failed to execuate program", "Error",
+                MB_OK | MB_ICONERROR);
     return false;
   }
 
@@ -323,13 +321,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   overlay = CreateWindowEx(WS_EX_TOPMOST, WIN_CLASS_NAME, L"", WS_POPUP, 0, 0,
                            virtualWidth, virtualHeight, NULL, NULL,
                            GetModuleHandle(NULL), NULL);
+
   // todo 怎么用 overlay 实现
   // SetLayeredWindowAttributes(overlay, RGB(0, 0, 0), 0, LWA_COLORKEY);
   // SetLayeredWindowAttributes(overlay, 0, 255, LWA_ALPHA);
 
   if (overlay == NULL) {
-    MessageBox(NULL, _T("fail to create window failed"), _T("Error"), MB_OK);
-    return 1;
+    MessageBoxA(NULL, "fail to create window failed", "Error",
+                MB_OK | MB_ICONERROR);
+    return false;
   }
 
   ShowWindow(overlay, nCmdShow);
@@ -363,7 +363,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   wglMakeCurrent(g_hdc, g_glrc);
 
   if (!gladLoadGL()) {
-    MessageBox(NULL, _T("failed to run gladLoadGL"), _T("Error"), MB_OK);
+    MessageBoxA(NULL, "failed to run gladLoadGL", "Error",
+                MB_OK | MB_ICONERROR);
     return false;
   }
 
@@ -376,10 +377,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
   // clang-format off
   float vertices[] = {
-      0,    0,  0,    0,   0,                     // top left
-      (float)virtualWidth,   0, 0,   1,   0,     // top right
-      0,   (float)virtualHeight, 0,   0,   1,     // bottom left
-      (float)virtualWidth,   (float)virtualHeight, 0,   1,   1 // bottom   right
+      0,                    0,  0,  0,  0,     // top left
+      (float)virtualWidth,  0,  0,  1,  0,     // top right
+      0, (float)virtualHeight,  0,  0,  1,     // bottom left
+      (float)virtualWidth,  (float)virtualHeight, 0,  1,  1 // bottom right
   };
   unsigned int indices[] = {
     0,1,2,
@@ -442,12 +443,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   FT_Face face;
 
   if (FT_Init_FreeType(&ft)) {
-    MessageBox(NULL, _T("ERROR::FREETYPE: Could not init FreeType Library"),
-               _T("message"), MB_OK);
+    MessageBoxA(NULL, "ERROR::FREETYPE: Could not init FreeType Library",
+                "Error", MB_OK | MB_ICONERROR);
     return 1;
   }
   if (FT_New_Face(ft, fontPath.c_str(), 0, &face)) {
-    MessageBoxA(NULL, fontPath.c_str(), "failed to load font", MB_OK);
+    std::string msgerr("failed to load font:");
+    msgerr += fontPath;
+    MessageBoxA(NULL, msgerr.c_str(), "ERROR", MB_OK | MB_ICONERROR);
     return 1;
   }
 
@@ -563,6 +566,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
           flashLight.isEnabled = false;
           SetFocus(overlay);
           break;
+        case VK_ESCAPE:
+          PostQuitMessage(0);
+          return 0;
         default:
           break;
       }
@@ -601,10 +607,33 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
       return 0;
     }
     case WM_TIMER: {
-      HDC allDC = GetDC(NULL);
+      // HDC allDC = GetDC(NULL);
+      // GetCursorPos(&mouse_pos);
+      // color = GetPixel(allDC, (int)mouse_pos.x, (int)mouse_pos.y);
+      // DeleteDC(allDC);
+
       GetCursorPos(&mouse_pos);
-      color = GetPixel(allDC, (int)mouse_pos.x, (int)mouse_pos.y);
-      DeleteDC(allDC);
+
+      // 计算从屏幕坐标到原始截图坐标的变换
+      // 考虑相机的缩放和平移
+      float screenCenterX = virtualWidth * 0.5f;
+      float screenCenterY = virtualHeight * 0.5f;
+
+      float screenRelX = (mouse_pos.x - screenCenterX) / camera.scale;
+      float screenRelY = (mouse_pos.y - screenCenterY) / camera.scale;
+
+      int originalX = (int)(screenRelX + camera.position.x + screenCenterX);
+      int originalY = (int)(screenRelY + camera.position.y + screenCenterY);
+
+      // 确保坐标在有效范围内
+      originalX = (originalX < 0)               ? 0
+                  : (originalX >= virtualWidth) ? virtualWidth - 1
+                                                : originalX;
+      originalY = (originalY < 0)                ? 0
+                  : (originalY >= virtualHeight) ? virtualHeight - 1
+                                                 : originalY;
+
+      color = GetPixel(g_hdc, originalX, originalY);
 
       if (last_pos.x != mouse_pos.x || last_pos.y != mouse_pos.y) {
         if (isDragging) {
@@ -641,15 +670,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
         float scale = 1.0f;
         float padding = pixel_height * scale * 2;
 
-        // Vec3f(r / 255.0f, g / 255.0f, b / 255.0f)
-        RenderText(textbuf, tx, ty, scale, Vec3f(0.5, 0.8f, 0.2f));
+        // Vec3f color = Vec3f(0.5, 0.8f, 0.2f);
+        Vec3f color = Vec3f(r / 255.0f, g / 255.0f, b / 255.0f);
+
+        RenderText(textbuf, tx, ty, scale, color);
 
         sz = std::snprintf(nullptr, 0, "HEX: #%02X%02X%02X", r, g, b);
         textbuf.resize(sz + 1);
         std::sprintf(textbuf.data(), "HEX: #%02X%02X%02X", r, g, b);
 
         ty += padding;
-        RenderText(textbuf, tx, ty, scale, Vec3f(0.5, 0.8f, 0.2f));
+        RenderText(textbuf, tx, ty, scale, color);
 
         sz = std::snprintf(nullptr, 0, "HSV: (%.0f°, %.0f%%, %.0f%%)", h,
                            s * 100, v * 100);
@@ -657,7 +688,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
         std::sprintf(textbuf.data(), "HSV: (%.0f°, %.0f%%, %.0f%%)", h, s * 100,
                      v * 100);
         ty += padding;
-        RenderText(textbuf, tx, ty, scale, Vec3f(0.5, 0.8f, 0.2f));
+        RenderText(textbuf, tx, ty, scale, color);
       }
 #endif
       RenderEnd();
