@@ -138,6 +138,11 @@ Mat4 ortho(float left, float right, float bottom, float top) {
   return r;
 }
 
+//? apos 理解成物体在世界坐标的位置(未变换)，apos-camerapos 实际上就是移动偏移量
+//? 这个物体范围就是apos= 0 0 vw vh ，-camerapos  后相当于把原点移动了偏移量
+//? 此时 物体的0 0 在 -camerapos
+//? 屏幕坐标：Y轴向下为正
+//? OpenGL坐标：Y轴向上为正
 std::string vertexShader = R"(
 #version 330 core
 
@@ -155,7 +160,7 @@ uniform vec2 screenshotSize;
 void main()
 {
     // BitmapToMem 存储时已经倒过来了
-    vec2 ndc = vec2((((aPos.x - cameraPos.x) / uResolution.x)* 2.0 - 1.0) * cameraScale,
+    vec2 ndc = vec2((((aPos.x - cameraPos.x) / uResolution.x) * 2.0 - 1.0) * cameraScale,
         (((aPos.y + cameraPos.y ) / uResolution.y) * 2.0 - 1.0) * cameraScale);
     gl_Position = vec4(ndc, 0, 1.0);
     TexCoord = aTexCoord;
@@ -246,6 +251,7 @@ GLuint shader_img;
 GLuint screen_texture;
 GLuint screenVBO, screenVAO, screenEBO;
 
+unsigned char pixel[4];
 //& >>>>>>>>>>>> function
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 void checkCompileErrors(GLuint shader, const std::string& type);
@@ -268,9 +274,6 @@ void RenderBegin() {
 
 void RenderEnd() { SwapBuffers(g_hdc); }
 
-// Source - https://stackoverflow.com/a/24386991
-// Posted by Pixelchemist
-// Retrieved 2025-11-19, License - CC BY-SA 3.0
 template <class T>
 T file_path(T const& path, T const& delims = "/\\") {
   return path.substr(0, path.find_last_of(delims));
@@ -406,7 +409,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   auto hbitmap = CaptureScreenToBitmap(virtualWidth, virtualHeight);
   auto data = BitmapToMem(hbitmap, virtualWidth, virtualHeight);
 
-  // glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, screen_texture);
 
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, virtualWidth, virtualHeight, 0,
@@ -607,38 +609,38 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
       return 0;
     }
     case WM_TIMER: {
-      // HDC allDC = GetDC(NULL);
-      // GetCursorPos(&mouse_pos);
-      // color = GetPixel(allDC, (int)mouse_pos.x, (int)mouse_pos.y);
-      // DeleteDC(allDC);
-
       GetCursorPos(&mouse_pos);
+      ScreenToClient(overlay, &mouse_pos);
 
       // 计算从屏幕坐标到原始截图坐标的变换
       // 考虑相机的缩放和平移
-      float screenCenterX = virtualWidth * 0.5f;
-      float screenCenterY = virtualHeight * 0.5f;
-
-      float screenRelX = (mouse_pos.x - screenCenterX) / camera.scale;
-      float screenRelY = (mouse_pos.y - screenCenterY) / camera.scale;
-
-      int originalX = (int)(screenRelX + camera.position.x + screenCenterX);
-      int originalY = (int)(screenRelY + camera.position.y + screenCenterY);
-
-      // 确保坐标在有效范围内
-      originalX = (originalX < 0)               ? 0
-                  : (originalX >= virtualWidth) ? virtualWidth - 1
-                                                : originalX;
-      originalY = (originalY < 0)                ? 0
-                  : (originalY >= virtualHeight) ? virtualHeight - 1
-                                                 : originalY;
-
-      color = GetPixel(g_hdc, originalX, originalY);
+      // float screenCenterX = virtualWidth * 0.5f;
+      // float screenCenterY = virtualHeight * 0.5f;
+      //
+      // float screenRelX = (mouse_pos.x - screenCenterX) / camera.scale;
+      // float screenRelY = (mouse_pos.y - screenCenterY) / camera.scale;
+      //
+      // int originalX = (int)(screenRelX + camera.position.x + screenCenterX);
+      // int originalY = (int)(screenRelY + camera.position.y + screenCenterY);
+      //
+      // // 确保坐标在有效范围内
+      // originalX = (originalX < 0)               ? 0
+      //             : (originalX >= virtualWidth) ? virtualWidth - 1
+      //                                           : originalX;
+      // originalY = (originalY < 0)                ? 0
+      //             : (originalY >= virtualHeight) ? virtualHeight - 1
+      //                                            : originalY;
+      // color =
+      //     GetPixel(g_hdc, originalX, originalY);  // 单屏幕时正确，双屏有问题
+      // color = GetPixel(g_hdc, mouse_pos.x,
+      //                  mouse_pos.y);  // 双屏幕正确，单屏幕有问题
 
       if (last_pos.x != mouse_pos.x || last_pos.y != mouse_pos.y) {
         if (isDragging) {
+          //? 放大后偏移移动量减小
           float dx = (last_pos.x - mouse_pos.x) / camera.scale;
           float dy = (last_pos.y - mouse_pos.y) / camera.scale;
+
           camera.position += Vec2f(dx, dy);
           camera.velocity = Vec2f(dx * rate, dy * rate);
         }
@@ -654,11 +656,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
 
 #ifdef FREETYPE
       if (flashLight.isEnabled) {
-        // auto x = mouse_pos.x;
-        // auto y = mouse_pos.y;
-        auto r = GetRValue(color);
-        auto g = GetGValue(color);
-        auto b = GetBValue(color);
+        // auto r = GetRValue(color);
+        // auto g = GetGValue(color);
+        // auto b = GetBValue(color);
+        int r = pixel[0];
+        int g = pixel[1];
+        int b = pixel[2];
+
         float h, s, v;
         RGBtoHSV(r, g, b, h, s, v);
         int sz;
@@ -670,7 +674,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
         float scale = 1.0f;
         float padding = pixel_height * scale * 2;
 
-        // Vec3f color = Vec3f(0.5, 0.8f, 0.2f);
         Vec3f color = Vec3f(r / 255.0f, g / 255.0f, b / 255.0f);
 
         RenderText(textbuf, tx, ty, scale, color);
@@ -692,6 +695,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
       }
 #endif
       RenderEnd();
+
+      int glX = mouse_pos.x;
+      int glY = virtualHeight - 1 - mouse_pos.y;
+      glReadBuffer(GL_FRONT);
+      glReadPixels(glX, glY, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
 
       return 0;
     }
