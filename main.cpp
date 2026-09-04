@@ -19,6 +19,9 @@
 #define BUF_SIZE 1024
 #define REFRESH_TIMER_ID 1
 
+#define VELOCITY_THRESHOLD 15.0
+#define INITIAL_FL_DELTA_RADIUS 250.0
+
 #define wheelScale 0.005
 #define scaleFriction 3.0
 #define rate 60.0
@@ -26,8 +29,6 @@
 #define radiusDeceleration 10.0
 #define dragFriction 6.0
 
-#define VELOCITY_THRESHOLD 15.0
-#define INITIAL_FL_DELTA_RADIUS 250.0
 
 const wchar_t WIN_CLASS_NAME[] = _T("WHAT_8MTfo7IzrQ");
 const wchar_t MUTEX_NAME[] = _T("WHAT_1JzKDIayja");
@@ -108,15 +109,15 @@ typedef struct Camera {
 
 #ifdef FREETYPE
 struct Character {
-  GLuint TextureID;  // 字形纹理的ID
-  Vec2i Size;        // 字形大小
-  Vec2i Bearing;     // 从基准线到字形左部/顶部的偏移值
-  FT_Pos Advance;    // 原点距下一个字形原点的距离
+  GLuint TextureID;
+  Vec2i Size;
+  Vec2i Bearing;
+  FT_Pos Advance;
 };
 #endif
 
 struct Mat4 {
-  float m[16];  // 列主序
+  float m[16];
 
   static Mat4 identity() {
     Mat4 r = {};
@@ -138,11 +139,6 @@ Mat4 ortho(float left, float right, float bottom, float top) {
   return r;
 }
 
-//? apos 理解成物体在世界坐标的位置(未变换)，apos-camerapos 实际上就是移动偏移量
-//? 这个物体范围就是apos= 0 0 vw vh ，-camerapos  后相当于把原点移动了偏移量
-//? 此时 物体的0 0 在 -camerapos
-//? 屏幕坐标：Y轴向下为正
-//? OpenGL坐标：Y轴向上为正
 std::string vertexShader = R"(
 #version 330 core
 
@@ -325,10 +321,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                            virtualWidth, virtualHeight, NULL, NULL,
                            GetModuleHandle(NULL), NULL);
 
-  // todo 怎么用 overlay 实现
-  // SetLayeredWindowAttributes(overlay, RGB(0, 0, 0), 0, LWA_COLORKEY);
-  // SetLayeredWindowAttributes(overlay, 0, 255, LWA_ALPHA);
-
   if (overlay == NULL) {
     MessageBoxA(NULL, "fail to create window failed", "Error",
                 MB_OK | MB_ICONERROR);
@@ -348,7 +340,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
   SetTimer(overlay, REFRESH_TIMER_ID, 16, NULL);
 
-  //& <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< init opengl
   g_hdc = GetDC(overlay);
   PIXELFORMATDESCRIPTOR pfd = {sizeof(PIXELFORMATDESCRIPTOR)};
   pfd.nVersion = 1;
@@ -378,7 +369,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   glGenVertexArrays(1, &screenVAO);
   glGenBuffers(1, &screenEBO);
 
-  // clang-format off
   float vertices[] = {
       0,                    0,  0,  0,  0,     // top left
       (float)virtualWidth,  0,  0,  1,  0,     // top right
@@ -389,7 +379,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     0,1,2,
     1,2,3
   };
-  // clang-format on
 
   glBindVertexArray(screenVAO);
   glBindBuffer(GL_ARRAY_BUFFER, screenVBO);
@@ -420,20 +409,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
 
-  glBindTexture(GL_TEXTURE_2D, 0);  // 解绑
-  glBindVertexArray(0);             // 解绑
+  glBindTexture(GL_TEXTURE_2D, 0);
+  glBindVertexArray(0);
 
   DeleteObject(hbitmap);
   delete data;
 
-  // these may not be modified
   float ratio[2] = {(float)virtualWidth, (float)virtualHeight};
   glUseProgram(shader_img);
   glUniform2fv(glGetUniformLocation(shader_img, "uResolution"), 1, ratio);
   glUniform2fv(glGetUniformLocation(shader_img, "windowSize"), 1, ratio);
 
 #ifdef FREETYPE
-  //& for text
   // https://learnopengl-cn.github.io/06%20In%20Practice/02%20Text%20Rendering/
   char pathBuf[BUF_SIZE] = {};
   GetModuleFileNameA(NULL, pathBuf, BUF_SIZE);
@@ -460,7 +447,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
   shader_txt = createShader(textVertShader, textfragmentShader);
 
-  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);  // 禁用字节对齐限制
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
   for (GLubyte c = 0; c < 128; c++) {
     if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
@@ -487,7 +474,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     Characters.insert(std::pair<GLchar, Character>(c, character));
   }
 
-  glBindTexture(GL_TEXTURE_2D, 0);  // 解绑
+  glBindTexture(GL_TEXTURE_2D, 0);
 
   FT_Done_Face(face);
   FT_Done_FreeType(ft);
@@ -505,10 +492,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), 0);
   glEnableVertexAttribArray(0);
 
-  glBindVertexArray(0);  // 解绑
-
+  glBindVertexArray(0);
 #endif
-  //& >>>>>>>>>>>>>>>>>>>>>>>>>>>>>> init opengl
 
   MSG msg = {};
   while (true) {
@@ -601,39 +586,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
       camera.scalePivot = Vec2f((float)mouse_pos.x, (float)mouse_pos.y);
       return 0;
     }
-    case WM_PAINT: {
-      PAINTSTRUCT ps;
-      //! 这里必须要手动绘制一下，不然peekmessage不会处理wm_paint事件
-      BeginPaint(hwnd, &ps);
-      EndPaint(hwnd, &ps);
-      return 0;
-    }
+    // case WM_PAINT: {
+    //   PAINTSTRUCT ps;
+    //   //!
+    //   BeginPaint(hwnd, &ps);
+    //   EndPaint(hwnd, &ps);
+    //   return 0;
+    // }
     case WM_TIMER: {
       GetCursorPos(&mouse_pos);
       ScreenToClient(overlay, &mouse_pos);
-
-      // 计算从屏幕坐标到原始截图坐标的变换
-      // 考虑相机的缩放和平移
-      // float screenCenterX = virtualWidth * 0.5f;
-      // float screenCenterY = virtualHeight * 0.5f;
-      //
-      // float screenRelX = (mouse_pos.x - screenCenterX) / camera.scale;
-      // float screenRelY = (mouse_pos.y - screenCenterY) / camera.scale;
-      //
-      // int originalX = (int)(screenRelX + camera.position.x + screenCenterX);
-      // int originalY = (int)(screenRelY + camera.position.y + screenCenterY);
-      //
-      // // 确保坐标在有效范围内
-      // originalX = (originalX < 0)               ? 0
-      //             : (originalX >= virtualWidth) ? virtualWidth - 1
-      //                                           : originalX;
-      // originalY = (originalY < 0)                ? 0
-      //             : (originalY >= virtualHeight) ? virtualHeight - 1
-      //                                            : originalY;
-      // color =
-      //     GetPixel(g_hdc, originalX, originalY);  // 单屏幕时正确，双屏有问题
-      // color = GetPixel(g_hdc, mouse_pos.x,
-      //                  mouse_pos.y);  // 双屏幕正确，单屏幕有问题
 
       if (last_pos.x != mouse_pos.x || last_pos.y != mouse_pos.y) {
         if (isDragging) {
@@ -656,9 +618,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
 
 #ifdef FREETYPE
       if (flashLight.isEnabled) {
-        // auto r = GetRValue(color);
-        // auto g = GetGValue(color);
-        // auto b = GetBValue(color);
         int r = pixel[0];
         int g = pixel[1];
         int b = pixel[2];
@@ -741,8 +700,6 @@ HBITMAP CaptureScreenToBitmap(int width, int height) {
 
   HBITMAP hBitmap = CreateCompatibleBitmap(hScreen, width, height);
   SelectObject(hMemDC, hBitmap);
-
-  //? 复制屏幕到 hBitmap
   BitBlt(hMemDC, 0, 0, width, height, hScreen, 0, 0, SRCCOPY);
 
   DeleteDC(hMemDC);
@@ -801,28 +758,25 @@ void checkCompileErrors(GLuint shader, const std::string& type) {
 
 GLuint createShader(std::string& vert, std::string& frag) {
   GLuint vertex, fragment;
-  // vertex shader
+
   vertex = glCreateShader(GL_VERTEX_SHADER);
   const char* vertSrc = vert.c_str();
   glShaderSource(vertex, 1, &vertSrc, NULL);
   glCompileShader(vertex);
-
   checkCompileErrors(vertex, "VERTEX");
-  // fragment Shader
+
   const char* fragSrc = frag.c_str();
   fragment = glCreateShader(GL_FRAGMENT_SHADER);
   glShaderSource(fragment, 1, &fragSrc, NULL);
   glCompileShader(fragment);
   checkCompileErrors(fragment, "FRAGMENT");
-  // shader Program
+
   GLuint ID = glCreateProgram();
   glAttachShader(ID, vertex);
   glAttachShader(ID, fragment);
   glLinkProgram(ID);
   checkCompileErrors(ID, "PROGRAM");
 
-  // delete the shaders as they're linked into our program now and no longer
-  // necessary
   glDeleteShader(vertex);
   glDeleteShader(fragment);
   return ID;
@@ -850,14 +804,13 @@ void RenderScreen_raw() {
   glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT,
                  (void*)(0 * sizeof(unsigned int)));
 
-  glBindVertexArray(0);             // 解绑
-  glBindTexture(GL_TEXTURE_2D, 0);  // 解绑
+  glBindVertexArray(0);
+  glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 #ifdef FREETYPE
 void RenderText(std::string& text, GLfloat x, GLfloat y, GLfloat scale,
                 Vec3f color) {
-  // 激活对应的渲染状态
   glUseProgram(shader_txt);
 
   glActiveTexture(GL_TEXTURE0);
@@ -870,7 +823,6 @@ void RenderText(std::string& text, GLfloat x, GLfloat y, GLfloat scale,
   glUniformMatrix4fv(glGetUniformLocation(shader_txt, "projection"), 1,
                      GL_FALSE, projection.m);
 
-  // 遍历文本中所有的字符
   std::string::const_iterator c;
   for (c = text.begin(); c != text.end(); c++) {
     Character ch = Characters[*c];
@@ -881,8 +833,6 @@ void RenderText(std::string& text, GLfloat x, GLfloat y, GLfloat scale,
     GLfloat w = ch.Size.x * scale;
     GLfloat h = ch.Size.y * scale;
 
-    // 对每个字符更新VBO
-    // clang-format off
     GLfloat vertices[6][4] = {
         {xpos, ypos + h, 0.0, 0.0},
         {xpos, ypos, 0.0, 1.0},
@@ -890,19 +840,14 @@ void RenderText(std::string& text, GLfloat x, GLfloat y, GLfloat scale,
         {xpos, ypos + h, 0.0, 0.0},
         {xpos + w, ypos, 1.0, 1.0},
         {xpos + w, ypos + h, 1.0, 0.0}};
-    // clang-format on
 
-    // 在四边形上绘制字形纹理
     glBindTexture(GL_TEXTURE_2D, ch.TextureID);
-    // 更新VBO内存的内容
     glBindBuffer(GL_ARRAY_BUFFER, textVBO);
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
-    // 绘制四边形
     glDrawArrays(GL_TRIANGLES, 0, 6);
-    // 更新位置到下一个字形的原点，注意单位是1/64像素
     x += (ch.Advance >> 6) *
-         scale;  // 位偏移6个单位来获取单位为像素的值 (2^6 = 64)
+         scale; 
   }
   glBindVertexArray(0);
   glBindTexture(GL_TEXTURE_2D, 0);

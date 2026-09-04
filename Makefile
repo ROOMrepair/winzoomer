@@ -3,15 +3,16 @@ CXX = g++
 MKDIR = mkdir -p
 RM= rm -f
 
-
 BUILD_DIR = ./build
-TARGET = $(BUILD_DIR)/colorpicker
+TARGET = $(BUILD_DIR)/winzoomer
 DEFINE = -DUNICODE -D_UNICODE
 
-# freetype
-USE_FREETYPE = 0
+#? set 0 to disable freetype
+USE_FREETYPE = 1
+FREETYPE_LIBPATH = -L./freetype/
+
+#? change this include path
 FREETYPE_INCLUDE = -ID:/Sources/lib-Packages/freetype-2.10.0/include/
-FREETYPE_LIBPATH = -LD:/Sources/lib-Packages/freetype-2.10.0/build_dll/
 
 INCLUDE = -I./glad/include/
 LIBS = -lkernel32 -luser32 -lgdi32 -lShcore -lopengl32
@@ -23,10 +24,10 @@ ifeq ($(USE_FREETYPE), 1)
     DEFINE += -DFREETYPE
 endif
 
-# need this for mingw to find start up wWinMain
+#? seems that this is needed for mingw to find start up wWinMain
 LDFLAGS += -municode -mwindows
 
-CXXFLAGS = -Wall -Wextra $(DEFINE) -municode -mwindows $(INCLUDE)
+CXXFLAGS = -Wall -Wextra -Wno-missing-field-initializers $(DEFINE) -municode -mwindows $(INCLUDE)
 
 OBJECT = $(BUILD_DIR)/main.o $(BUILD_DIR)/glad.o
 
