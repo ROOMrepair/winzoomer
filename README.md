@@ -14,3 +14,6 @@ https://github.com/tsoding/boomer 的一个可能的 windows 版本
 |缩放手电筒(包括画面)|<kbd>Ctrl</kbd> + <kbd>滚轮</kbd>  |
 |缩放手电筒|<kbd>Shift</kbd> + <kbd>滚轮</kbd> |
 |重置|<kbd>R</kbd>|
+| 实时画面|<kbd>U</kbd>|
+
+

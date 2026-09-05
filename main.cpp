@@ -4,6 +4,7 @@
 #include <libloaderapi.h>
 #include <tchar.h>
 #include <strsafe.h>
+#include <windows.h>
 #include <windowsx.h>
 #include <math.h>
 #include <ShellScalingApi.h>
@@ -16,6 +17,12 @@
 
 #include <glad/glad.h>
 
+#ifndef WDA_EXCLUDEFROMCAPTURE
+// Added to the Windows SDK in the Windows 10 2004 timeframe. Keep the
+// numeric value here so the project also builds with older MinGW headers.
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+
 #define BUF_SIZE 1024
 #define REFRESH_TIMER_ID 1
 
@@ -24,11 +31,10 @@
 
 #define wheelScale 0.005
 #define scaleFriction 3.0
-#define rate 60.0
+#define rate 30.0
 #define miniScale 0.01
 #define radiusDeceleration 10.0
 #define dragFriction 6.0
-
 
 const wchar_t WIN_CLASS_NAME[] = _T("WHAT_8MTfo7IzrQ");
 const wchar_t MUTEX_NAME[] = _T("WHAT_1JzKDIayja");
@@ -232,6 +238,7 @@ Camera camera;
 
 bool isDragging;
 float dt;
+bool useRealTime = false;
 
 #ifdef FREETYPE
 std::map<GLchar, Character> Characters;
@@ -248,14 +255,101 @@ GLuint screen_texture;
 GLuint screenVBO, screenVAO, screenEBO;
 
 unsigned char pixel[4];
+
+struct ScreenCaptureBuffer {
+  int width = 0;
+  int height = 0;
+  HDC memoryDC = NULL;
+  HBITMAP bitmap = NULL;
+  HGDIOBJ previousBitmap = NULL;
+  unsigned char* pixels = nullptr;
+
+  bool initialize(int captureWidth, int captureHeight) {
+    width = captureWidth;
+    height = captureHeight;
+
+    memoryDC = CreateCompatibleDC(NULL);
+    if (memoryDC == NULL) {
+      return false;
+    }
+
+    BITMAPINFO bitmapInfo = {};
+    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    // Keep a bottom-up DIB so the existing OpenGL texture coordinates remain
+    // unchanged (the first row in memory is the bottom row of the desktop).
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = height;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+
+    //? like GetDIBits(HDC,HBITMAP,...)
+    //? 建一张 GDI 能使用的 HBITMAP，同时返回其指针
+    bitmap = CreateDIBSection(NULL, &bitmapInfo, DIB_RGB_COLORS,
+                              reinterpret_cast<void**>(&pixels), NULL, 0);
+    if (bitmap == NULL || pixels == nullptr) {
+      shutdown();
+      return false;
+    }
+
+    //? 恢复原状态
+    previousBitmap = SelectObject(memoryDC, bitmap);
+    if (previousBitmap == NULL) {
+      shutdown();
+      return false;
+    }
+
+    return true;
+  }
+  /*? how to capture screen
+      1. getdc -> create compatiblebitmap of this dc
+      2. bitblt from compatiblebitmap
+  */
+  bool capture(int sourceX, int sourceY) {
+    if (memoryDC == NULL || bitmap == NULL || pixels == nullptr) {
+      return false;
+    }
+
+    HDC screenDC = GetDC(NULL);
+    if (screenDC == NULL) {
+      return false;
+    }
+
+    BOOL copied = BitBlt(memoryDC, 0, 0, width, height, screenDC, sourceX,
+                         sourceY, SRCCOPY);
+    ReleaseDC(NULL, screenDC);
+    return copied != FALSE;
+  }
+
+  void shutdown() {
+    if (memoryDC != NULL && previousBitmap != NULL) {
+      SelectObject(memoryDC, previousBitmap);
+    }
+    if (bitmap != NULL) {
+      DeleteObject(bitmap);
+    }
+    if (memoryDC != NULL) {
+      DeleteDC(memoryDC);
+    }
+
+    width = 0;
+    height = 0;
+    memoryDC = NULL;
+    bitmap = NULL;
+    previousBitmap = NULL;
+    pixels = nullptr;
+  }
+};
+
+ScreenCaptureBuffer screenCapture;
+
 //& >>>>>>>>>>>> function
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 void checkCompileErrors(GLuint shader, const std::string& type);
 void RGBtoHSV(int r, int g, int b, float& h, float& s, float& v);
-HBITMAP CaptureScreenToBitmap(int width, int height);
-unsigned char* BitmapToMem(HBITMAP hbm, int width, int height);
 
 GLuint createShader(std::string& vert, std::string& frag);
+bool UpdateScreenTexture();
 void RenderScreen_raw();
 #ifdef FREETYPE
 void RenderText(std::string& text, GLfloat x, GLfloat y, GLfloat scale,
@@ -317,8 +411,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
   RegisterHotKey(NULL, 1, MOD_CONTROL | MOD_SHIFT, VK_F12);
 
-  overlay = CreateWindowEx(WS_EX_TOPMOST, WIN_CLASS_NAME, L"", WS_POPUP, 0, 0,
-                           virtualWidth, virtualHeight, NULL, NULL,
+  overlay = CreateWindowEx(WS_EX_TOPMOST, WIN_CLASS_NAME, L"overlay", WS_POPUP,
+                           0, 0, virtualWidth, virtualHeight, NULL, NULL,
                            GetModuleHandle(NULL), NULL);
 
   if (overlay == NULL) {
@@ -330,6 +424,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   ShowWindow(overlay, nCmdShow);
   SetWindowPos(overlay, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
   SetFocus(overlay);
+
+  // The screenshot source is the composed desktop (GetDC(NULL)). Exclude the
+  // overlay from OS-level capture so a future live-capture update cannot feed
+  // the rendered zoomed image back into its own texture.
+  if (!SetWindowDisplayAffinity(overlay, WDA_EXCLUDEFROMCAPTURE)) {
+    OutputDebugStringA(
+        "winzoomer: SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) failed\n");
+  }
 
   camera.scale = 1.0f;
   camera.deltaScale = 0.0f;
@@ -370,15 +472,28 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   glGenBuffers(1, &screenEBO);
 
   float vertices[] = {
-      0,                    0,  0,  0,  0,     // top left
-      (float)virtualWidth,  0,  0,  1,  0,     // top right
-      0, (float)virtualHeight,  0,  0,  1,     // bottom left
-      (float)virtualWidth,  (float)virtualHeight, 0,  1,  1 // bottom right
+      0,
+      0,
+      0,
+      0,
+      0,  // top left
+      (float)virtualWidth,
+      0,
+      0,
+      1,
+      0,  // top right
+      0,
+      (float)virtualHeight,
+      0,
+      0,
+      1,  // bottom left
+      (float)virtualWidth,
+      (float)virtualHeight,
+      0,
+      1,
+      1  // bottom right
   };
-  unsigned int indices[] = {
-    0,1,2,
-    1,2,3
-  };
+  unsigned int indices[] = {0, 1, 2, 1, 2, 3};
 
   glBindVertexArray(screenVAO);
   glBindBuffer(GL_ARRAY_BUFFER, screenVBO);
@@ -395,25 +510,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                         (void*)(3 * sizeof(float)));
   glEnableVertexAttribArray(1);
 
-  auto hbitmap = CaptureScreenToBitmap(virtualWidth, virtualHeight);
-  auto data = BitmapToMem(hbitmap, virtualWidth, virtualHeight);
+  if (!screenCapture.initialize(virtualWidth, virtualHeight) ||
+      !screenCapture.capture(virtualLeft, virtualTop)) {
+    MessageBoxA(NULL, "failed to capture the virtual screen", "Error",
+                MB_OK | MB_ICONERROR);
+    screenCapture.shutdown();
+    return false;
+  }
 
   glBindTexture(GL_TEXTURE_2D, screen_texture);
 
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, virtualWidth, virtualHeight, 0,
-               GL_BGRA, GL_UNSIGNED_BYTE, data);
+               GL_BGRA, GL_UNSIGNED_BYTE, screenCapture.pixels);
   glGenerateMipmap(GL_TEXTURE_2D);
 
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
 
   glBindTexture(GL_TEXTURE_2D, 0);
   glBindVertexArray(0);
-
-  DeleteObject(hbitmap);
-  delete data;
 
   float ratio[2] = {(float)virtualWidth, (float)virtualHeight};
   glUseProgram(shader_img);
@@ -500,6 +617,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) {
         KillTimer(overlay, REFRESH_TIMER_ID);
+        screenCapture.shutdown();
         wglMakeCurrent(NULL, NULL);
         wglDeleteContext(g_glrc);
         ReleaseDC(overlay, g_hdc);
@@ -522,6 +640,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
       TranslateMessage(&msg);
       DispatchMessage(&msg);
     }
+
+    MsgWaitForMultipleObjectsEx(0, NULL, INFINITE, QS_ALLINPUT,
+                                MWMO_INPUTAVAILABLE);
   }
 
   return 0;
@@ -530,19 +651,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
                             LPARAM lParam) {
   switch (uMsg) {
-    case WM_CREATE: {
-      return 0;
-    }
     case WM_DESTROY: {
       PostQuitMessage(0);
       return 0;
     }
     case WM_KEYUP: {
       switch (wParam) {
-        case 'F':
+        case 'F': {
           flashLight.isEnabled = !flashLight.isEnabled;
           break;
-        case 'R':
+        }
+        case 'R': {
           camera.scale = 1.0f;
           camera.deltaScale = 0.0f;
           camera.position = Vec2f(0.0f, 0.0f);
@@ -551,11 +670,30 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
           flashLight.radius = 100.0f;
           flashLight.deltaRadius = 0.0f;
           flashLight.isEnabled = false;
+          useRealTime = false;
+          glBindTexture(GL_TEXTURE_2D, screen_texture);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+          glBindTexture(GL_TEXTURE_2D, 0);
           SetFocus(overlay);
           break;
-        case VK_ESCAPE:
+        }
+        case 'U':{
+          useRealTime = !useRealTime;
+          if(useRealTime){
+            glBindTexture(GL_TEXTURE_2D, screen_texture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glBindTexture(GL_TEXTURE_2D, 0);
+          }else{
+            glBindTexture(GL_TEXTURE_2D, screen_texture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+            glBindTexture(GL_TEXTURE_2D, 0);
+          }
+          break;
+        }
+        case VK_ESCAPE: {
           PostQuitMessage(0);
           return 0;
+        }
         default:
           break;
       }
@@ -586,13 +724,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
       camera.scalePivot = Vec2f((float)mouse_pos.x, (float)mouse_pos.y);
       return 0;
     }
-    // case WM_PAINT: {
-    //   PAINTSTRUCT ps;
-    //   //!
-    //   BeginPaint(hwnd, &ps);
-    //   EndPaint(hwnd, &ps);
-    //   return 0;
-    // }
     case WM_TIMER: {
       GetCursorPos(&mouse_pos);
       ScreenToClient(overlay, &mouse_pos);
@@ -612,6 +743,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
 
       camera.update(Vec2f(virtualWidth, virtualHeight), dt, isDragging);
       flashLight.update(dt);
+
+      // Refresh the reusable screenshot buffer and update the existing GPU
+      // texture in place. If capture fails, keep displaying the last frame.
+      if(useRealTime){
+        UpdateScreenTexture();
+      }
 
       RenderBegin();
       RenderScreen_raw();
@@ -655,8 +792,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
 #endif
       RenderEnd();
 
+      //+ is it right?
       int glX = mouse_pos.x;
       int glY = virtualHeight - 1 - mouse_pos.y;
+
       glReadBuffer(GL_FRONT);
       glReadPixels(glX, glY, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
 
@@ -694,38 +833,16 @@ void RGBtoHSV(int r, int g, int b, float& h, float& s, float& v) {
   v = maxv;
 }
 
-HBITMAP CaptureScreenToBitmap(int width, int height) {
-  HDC hScreen = GetDC(NULL);
-  HDC hMemDC = CreateCompatibleDC(hScreen);
+bool UpdateScreenTexture() {
+  if (!screenCapture.capture(virtualLeft, virtualTop)) {
+    return false;
+  }
 
-  HBITMAP hBitmap = CreateCompatibleBitmap(hScreen, width, height);
-  SelectObject(hMemDC, hBitmap);
-  BitBlt(hMemDC, 0, 0, width, height, hScreen, 0, 0, SRCCOPY);
-
-  DeleteDC(hMemDC);
-  ReleaseDC(NULL, hScreen);
-
-  return hBitmap;
-}
-
-unsigned char* BitmapToMem(HBITMAP hbm, int width, int height) {
-  BITMAP bm;
-  GetObject(hbm, sizeof(BITMAP), &bm);
-  BITMAPINFOHEADER bi = {};
-  bi.biSize = sizeof(BITMAPINFOHEADER);
-  bi.biWidth = bm.bmWidth;
-  bi.biHeight = bm.bmHeight;
-  bi.biPlanes = 1;
-  bi.biBitCount = 32;
-  bi.biCompression = BI_RGB;
-  assert(width == bm.bmWidth && height == bm.bmHeight);
-  size_t size = bm.bmWidth * bm.bmHeight * 4;
-  unsigned char* data = new unsigned char[size];
-
-  HDC hdc = GetDC(NULL);
-  GetDIBits(hdc, hbm, 0, height, data, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
-  ReleaseDC(NULL, hdc);
-  return data;
+  glBindTexture(GL_TEXTURE_2D, screen_texture);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, virtualWidth, virtualHeight, GL_BGRA,
+                  GL_UNSIGNED_BYTE, screenCapture.pixels);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  return true;
 }
 
 void checkCompileErrors(GLuint shader, const std::string& type) {
@@ -834,20 +951,16 @@ void RenderText(std::string& text, GLfloat x, GLfloat y, GLfloat scale,
     GLfloat h = ch.Size.y * scale;
 
     GLfloat vertices[6][4] = {
-        {xpos, ypos + h, 0.0, 0.0},
-        {xpos, ypos, 0.0, 1.0},
-        {xpos + w, ypos, 1.0, 1.0},
-        {xpos, ypos + h, 0.0, 0.0},
-        {xpos + w, ypos, 1.0, 1.0},
-        {xpos + w, ypos + h, 1.0, 0.0}};
+        {xpos, ypos + h, 0.0, 0.0}, {xpos, ypos, 0.0, 1.0},
+        {xpos + w, ypos, 1.0, 1.0}, {xpos, ypos + h, 0.0, 0.0},
+        {xpos + w, ypos, 1.0, 1.0}, {xpos + w, ypos + h, 1.0, 0.0}};
 
     glBindTexture(GL_TEXTURE_2D, ch.TextureID);
     glBindBuffer(GL_ARRAY_BUFFER, textVBO);
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glDrawArrays(GL_TRIANGLES, 0, 6);
-    x += (ch.Advance >> 6) *
-         scale; 
+    x += (ch.Advance >> 6) * scale;
   }
   glBindVertexArray(0);
   glBindTexture(GL_TEXTURE_2D, 0);
