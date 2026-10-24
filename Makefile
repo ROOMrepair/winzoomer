@@ -7,6 +7,8 @@ BUILD_DIR = ./build
 TARGET = $(BUILD_DIR)/winzoomer
 DEFINE = -DUNICODE -D_UNICODE
 
+DEBUG = 0
+
 #? set 0 to disable freetype
 USE_FREETYPE = 1
 FREETYPE_LIBPATH = -L./freetype/
@@ -24,6 +26,10 @@ ifeq ($(USE_FREETYPE), 1)
     DEFINE += -DFREETYPE
 endif
 
+ifeq ($(DEBUG),1)
+  	DEFINE += -DDEBUG
+endif
+
 #? seems that this is needed for mingw to find start up wWinMain
 LDFLAGS += -municode -mwindows
 
@@ -37,8 +43,8 @@ $(TARGET): $(OBJECT)
 	$(MKDIR) $(BUILD_DIR)
 	$(CXX) -o $@  $^ $(LDFLAGS) $(LIBS)
 
-$(BUILD_DIR)/main.o: main.cpp
-	$(CXX) $(CXXFLAGS) -c $^ -o $@
+$(BUILD_DIR)/main.o: main.cpp system_cursor.h cursor_recovery.h
+	$(CXX) $(CXXFLAGS) -c main.cpp -o $@
 
 $(BUILD_DIR)/glad.o: ./glad/src/glad.c
 	$(CXX) $(CXXFLAGS) -c $^ -o $@
