@@ -606,7 +606,8 @@ bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba) {
 
   const size_t offset =
       (static_cast<size_t>(screenCapture.height - 1 - y) * screenCapture.width +
-       static_cast<size_t>(x)) * 4;
+       static_cast<size_t>(x)) *
+      4;
 
   rgba[0] = screenCapture.pixels[offset + 2];
   rgba[1] = screenCapture.pixels[offset + 1];
@@ -631,8 +632,9 @@ bool CacheFrozenScreenTexture() {
   GLint previousTexture = 0, previousPackBuffer = 0;
 
   //? 查询当前活动单元glActiveTexture使用纹理
-  glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture); // 名称
-  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &previousPackBuffer); // 查询当前绑定buffer
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);  // 名称
+  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING,
+                &previousPackBuffer);  // 查询当前绑定buffer
   const GLenum packing[] = {GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH,
                             GL_PACK_SKIP_ROWS, GL_PACK_SKIP_PIXELS};
   GLint previousPacking[4]{};
@@ -641,22 +643,23 @@ bool CacheFrozenScreenTexture() {
     glPixelStorei(packing[i], i == 0 ? 1 : 0);
   }
 
-/*
-  只有当 glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); 设置不经过读回 pbo 
-  才可以通过glGetTexImage(..., screenCapture.pixels);直接都会内存
-  所以要保存previous GL_PIXEL_PACK_BUFFER_BINDING 
-*/  
+  /*
+    只有当 glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); 设置不经过读回 pbo
+    才可以通过glGetTexImage(..., screenCapture.pixels);直接都会内存
+    所以要保存previous GL_PIXEL_PACK_BUFFER_BINDING
+  */
   glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
   glBindTexture(GL_TEXTURE_2D, screen_texture);
   glGetTexImage(GL_TEXTURE_2D, 0, GL_BGRA, GL_UNSIGNED_BYTE,
-                 screenCapture.pixels);
+                screenCapture.pixels);
   const GLenum error = glGetError();
   glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
   glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(previousPackBuffer));
   for (int i = 0; i < 4; ++i) glPixelStorei(packing[i], previousPacking[i]);
   if (error != GL_NO_ERROR) {
     screenCapture.shutdown();
-    OutputDebugStringA("winzoomer: failed to cache frozen image for color picking\n");
+    OutputDebugStringA(
+        "winzoomer: failed to cache frozen image for color picking\n");
     return false;
   }
   return true;
@@ -1203,9 +1206,10 @@ void SetInputPassthrough(bool enabledInputThrough) {
 }
 
 void ApplyPassthroughRawWheel(const RAWMOUSE& mouse, bool shiftDown,
-                             const POINT& overlayCursor) {
+                              const POINT& overlayCursor) {
   if (!useInputThroughWindow || !shiftDown ||
-      !(mouse.usButtonFlags & RI_MOUSE_WHEEL)) return;
+      !(mouse.usButtonFlags & RI_MOUSE_WHEEL))
+    return;
   const int delta = static_cast<SHORT>(mouse.usButtonData);
   if (delta == 0) return;
   camera.deltaScale += delta * wheelScale;
@@ -1246,6 +1250,36 @@ bool IsInsideRect(const RECT& rect, const POINT& src) {
   return src.x > rect.left && src.x < rect.right && src.y > rect.top &&
          src.y < rect.bottom;
 }
+bool CopyStringToClipBoard(const std::string& str) {
+  if (!overlay) return false;
+  HGLOBAL clipMem = GlobalAlloc(GMEM_MOVEABLE, str.length());
+  if (!clipMem) return false;
+
+  void* buffer = GlobalLock(clipMem);
+  if (!buffer) {
+    GlobalFree(clipMem);
+    return false;
+  }
+  std::memcpy(buffer, str.data(), str.length());
+  GlobalUnlock(clipMem);
+
+  if (!OpenClipboard(overlay)) {
+    GlobalFree(clipMem);
+    return false;
+  }
+  bool success = false;
+  if (EmptyClipboard()) {
+    success = SetClipboardData(CF_TEXT, clipMem) != nullptr;
+  }
+
+  CloseClipboard();
+  if (!success) {
+    GlobalFree(clipMem);
+    return false;
+  }
+
+  return true;
+}
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
                             LPARAM lParam) {
@@ -1256,7 +1290,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
       // Only mouse input is registered, so a fixed-size stack buffer suffices.
       if (useInputThroughWindow &&
           GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT,
-                          &input, &size, sizeof(RAWINPUTHEADER)) == sizeof(input) &&
+                          &input, &size,
+                          sizeof(RAWINPUTHEADER)) == sizeof(input) &&
           input.header.dwType == RIM_TYPEMOUSE &&
           (input.data.mouse.usButtonFlags & RI_MOUSE_WHEEL)) {
         POINT cursor{};
@@ -1282,6 +1317,35 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
       switch (wParam) {
         case 'F': {
           flashLight.isEnabled = !flashLight.isEnabled;
+          break;
+        }
+        case 'X': {
+          if (!flashLight.isEnabled) {
+            break;
+          }
+          int r = pixel[0];
+          int g = pixel[1];
+          int b = pixel[2];
+
+          int length = std::snprintf(nullptr, 0, "#%02X%02X%02X", r, g, b);
+          std::string colorStr(length + 1, '\0');
+          std::snprintf(colorStr.data(), colorStr.size(), "#%02X%02X%02X", r, g,
+                        b);
+          CopyStringToClipBoard(colorStr);
+          break;
+        }
+        case 'C': {
+          if (!flashLight.isEnabled) {
+            break;
+          }
+          int r = pixel[0];
+          int g = pixel[1];
+          int b = pixel[2];
+
+          int length = std::snprintf(nullptr, 0, "%d %d %d", r, g, b);
+          std::string colorStr(length + 1, '\0');
+          std::snprintf(colorStr.data(), colorStr.size(), "%d %d %d", r, g, b);
+          CopyStringToClipBoard(colorStr);
           break;
         }
         case 'R': {
@@ -1397,7 +1461,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
 
       if (flashLight.isEnabled) {
 #ifdef FREETYPE
-        const POINT samplePos = useInputThroughWindow ? mouse_pos : mouse_pos_target;
+        const POINT samplePos =
+            useInputThroughWindow ? mouse_pos : mouse_pos_target;
         const bool pixelValid = ReadScreenPixel(samplePos, pixel);
         if (!pixelValid) std::memset(pixel, 0, sizeof(pixel));
 
@@ -1422,7 +1487,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
           SimpleRenderOneLine(tx, ty, scale, color, "RGB: %d %d %d", r, g, b);
           ty += padding;
 
-          SimpleRenderOneLine(tx, ty, scale, color, "HEX: #%02X%02X%02X", r, g, b);
+          SimpleRenderOneLine(tx, ty, scale, color, "HEX: #%02X%02X%02X", r, g,
+                              b);
           ty += padding;
 
           SimpleRenderOneLine(tx, ty, scale, color,

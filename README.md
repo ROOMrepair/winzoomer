@@ -14,8 +14,10 @@ https://github.com/tsoding/boomer 的一个可能的 windows 版本
 |缩放手电筒(包括画面)|<kbd>Ctrl</kbd> + <kbd>滚轮</kbd>  |
 |缩放手电筒|<kbd>Shift</kbd> + <kbd>滚轮</kbd> |
 |重置|<kbd>R</kbd>|
+|取色到剪切板(HEX模式)|<kbd>X</kbd>|
+|取色(RGB模式)|<kbd>C</kbd>|
 | 实时画面|<kbd>U</kbd>|
-| 穿透模式 (danger!) |<kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>F11</kbd>|
+| 穿透模式 (danger!!) |<kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>F11</kbd>|
 | 穿透模式下缩放画面|<kbd>Shift</kbd> + <kbd>滚轮</kbd>|
 
 ## 系统光标恢复
