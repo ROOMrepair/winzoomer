@@ -5,8 +5,10 @@
 #include <cstring>
 #include <atomic>
 #include <string>
+#include <handleapi.h>
 #include <libloaderapi.h>
 #include <minwindef.h>
+#include <synchapi.h>
 #include <tchar.h>
 #include <strsafe.h>
 #include <windef.h>
@@ -14,16 +16,15 @@
 #include <windowsx.h>
 #include <math.h>
 #include <ShellScalingApi.h>
+
+#include "simpleMath.h"
+#include "simpleText.h"
+#include "simpleShader.h"
 #include "system_cursor.h"
 #include "cursor_recovery.h"
 
-#ifdef FREETYPE
-#include <ft2build.h>
-#include FT_FREETYPE_H
-#include <map>
-#endif
-
 #include <glad/glad.h>
+#include <winnt.h>
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
 // Added to the Windows SDK in the Windows 10 2004 timeframe. Keep the
@@ -41,55 +42,16 @@
 #define VELOCITY_THRESHOLD 15.0
 #define INITIAL_FL_DELTA_RADIUS 250.0
 #define OverlayViewPortMoveSpeed 1.2
-
 #define wheelScale 0.005
 #define scaleFriction 3.0
-#define rate 60.0
+#define velocity_movement 60.0
+#define FPS 60.0
 #define miniScale 0.01
 #define radiusDeceleration 10.0
 #define dragFriction 6.0
 
 const wchar_t WIN_CLASS_NAME[] = _T("winzoomer_wcls0");
 const wchar_t MUTEX_NAME[] = _T("winzoomer_mutex0");
-
-template <typename T>
-struct Vec2 {
-  T x, y;
-  Vec2() : x(0), y(0) {}
-  Vec2(T _x, T _y) : x(_x), y(_y) {}
-  Vec2 operator+(const T& s) const { return Vec2(x + s, y + s); }
-  Vec2 operator+(const Vec2& other) const {
-    return Vec2(x + other.x, y + other.y);
-  }
-  Vec2 operator-(const T& s) const { return Vec2(x - s, y - s); }
-  Vec2 operator-(const Vec2& other) const {
-    return Vec2(x - other.x, y - other.y);
-  }
-  Vec2 operator*(const T& s) const { return Vec2(x * s, y * s); }
-  Vec2 operator/(const T& s) const { return Vec2(x / s, y / s); }
-  Vec2& operator+=(const Vec2& v) {
-    this->x += v.x;
-    this->y += v.y;
-    return *this;
-  }
-  Vec2& operator-=(const Vec2& v) {
-    this->x -= v.x;
-    this->y -= v.y;
-    return *this;
-  }
-  float length() { return static_cast<T>(sqrt(x * x + y * y)); }
-};
-
-template <typename T>
-struct Vec3 {
-  Vec3(T _x, T _y, T _z) : x(_x), y(_y), z(_z) {}
-  T x, y, z;
-};
-
-typedef Vec2<float> Vec2f;
-typedef Vec2<int> Vec2i;
-typedef Vec3<int> Vec3i;
-typedef Vec3<float> Vec3f;
 
 typedef struct FlashLight {
   bool isEnabled;
@@ -130,191 +92,6 @@ typedef struct Camera {
     }
   }
 } Camera;
-
-#ifdef FREETYPE
-struct Character {
-  GLuint TextureID;
-  Vec2i Size;
-  Vec2i Bearing;
-  FT_Pos Advance;
-};
-#endif
-
-struct Mat4 {
-  float m[16];
-
-  static Mat4 identity() {
-    Mat4 r = {};
-    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
-    return r;
-  }
-};
-
-Mat4 ortho(float left, float right, float bottom, float top) {
-  Mat4 r = {};
-
-  r.m[0] = 2.0f / (right - left);
-  r.m[5] = 2.0f / (top - bottom);
-  r.m[10] = -1.0f;
-  r.m[12] = -(right + left) / (right - left);
-  r.m[13] = -(top + bottom) / (top - bottom);
-  r.m[15] = 1.0f;
-
-  return r;
-}
-
-std::string vertexShader = R"(
-#version 330 core
-
-layout(location = 0) in vec3 aPos;
-layout(location = 1) in vec2 aTexCoord;
-
-out vec2 TexCoord;
-
-uniform vec2 uResolution;
-uniform vec2 cameraPos;
-uniform float cameraScale;
-
-uniform vec2 screenshotSize;
-
-void main()
-{
-    // BitmapToMem 存储时已经倒过来了
-    vec2 ndc = vec2((((aPos.x - cameraPos.x) / uResolution.x) * 2.0 - 1.0) * cameraScale,
-        (((aPos.y + cameraPos.y ) / uResolution.y) * 2.0 - 1.0) * cameraScale);
-    gl_Position = vec4(ndc, 0, 1.0);
-    TexCoord = aTexCoord;
-}
-)";
-
-std::string fragmentShader = R"(
-#version 330 core
-
-in vec2 TexCoord;
-out vec4 FragColor;
-
-uniform sampler2D uTexture;
-uniform vec2 mousePos;
-uniform float flShadow;
-uniform float flRadius;
-uniform float cameraScale;
-uniform vec2 windowSize;
-
-void main()
-{
-
-  vec4 cursor = vec4(mousePos.x,windowSize.y - mousePos.y,0.0,1.0);
-
-  FragColor = mix(
-      texture(uTexture,TexCoord),
-      vec4(0.0,0.0,0.0,0.0),
-      length(cursor - gl_FragCoord) < (flRadius * cameraScale) ? 0.0 : flShadow
-      );
-}
-)";
-
-std::string textVertShader = R"(
-#version 330 core
-layout (location = 0) in vec4 vertex; // <vec2 pos, vec2 tex>
-out vec2 TexCoords;
-
-uniform mat4 projection;
-
-void main()
-{
-    gl_Position = projection * vec4(vertex.xy, 0.0, 1.0);
-    TexCoords = vertex.zw;
-}
-)";
-
-std::string textfragmentShader = R"(
-#version 330 core
-in vec2 TexCoords;
-out vec4 color;
-
-uniform sampler2D text;
-uniform vec3 textColor;
-
-void main()
-{
-    vec4 sampled = vec4(1.0, 1.0, 1.0, texture(text, TexCoords).r);
-    color = vec4(textColor, 1.0) * sampled;
-}
-
-)";
-
-std::string cursorVertShader = R"(
-#version 330 core
-layout (location = 0) in vec2 vertex;
-
-uniform mat4 projection;
-
-void main()
-{
-    gl_Position = projection * vec4(vertex.xy, 0.0, 1.0);
-}
-)";
-
-std::string cursorFragShader = R"(
-#version 330 core
-out vec4 color;
-
-uniform vec3 fillColor;
-
-void main()
-{
-    color = vec4(fillColor, 1.0);
-}
-
-)";
-
-//& >>>>>>>>>>>> state
-HWND overlay;
-HWND previousForegroundWindow = NULL;
-
-POINT mouse_pos;
-POINT mouse_pos_client;
-POINT last_pos_client;
-POINT mouse_pos_target;
-POINT overlayViewPortCenter;
-POINT overlayViewPortDelta;
-
-RECT overlayViewPort{};
-
-float dt;
-int virtualLeft, virtualTop, virtualWidth, virtualHeight;
-
-FlashLight flashLight;
-Camera camera;
-
-bool isDragging;
-bool useRealTime = false;
-bool useInputThroughWindow = false;
-
-//& opengl
-#ifdef FREETYPE
-std::map<GLchar, Character> Characters;
-FT_UInt pixel_height = 16;
-GLuint textVAO, textVBO;
-GLuint shader_txt;
-#endif
-
-HDC g_hdc = NULL;
-HGLRC g_glrc = NULL;
-GLuint shader_img;
-GLuint screen_texture;
-GLuint screenVBO, screenVAO, screenEBO;
-
-GLuint screen_upload_pbo[2] = {};
-GLsync screen_upload_fence[2] = {};
-int screen_upload_pbo_index = 0;
-size_t screen_upload_bytes = 0;
-bool screen_mipmaps_dirty = false;
-
-GLuint shader_cursor;
-GLuint cursor_vbo, cursor_vao;
-
-unsigned char pixel[4];
 
 struct ScreenCaptureBuffer {
   int width = 0;
@@ -414,8 +191,6 @@ struct ScreenCaptureBuffer {
   }
 };
 
-ScreenCaptureBuffer screenCapture;
-
 // The worker owns all GDI resources. The UI/OpenGL thread only leases the
 // latest completed pixel buffer, so neither BitBlt nor the upload can race it.
 struct RealtimeCapture {
@@ -482,7 +257,7 @@ struct RealtimeCapture {
 
       //? 控制截图 interval
       const DWORD elapsed = GetTickCount() - started;
-      const DWORD interval = static_cast<DWORD>(1000.0 / rate);
+      const DWORD interval = static_cast<DWORD>(1000.0 / FPS);
       const DWORD delay = elapsed < interval ? interval - elapsed : 1;
       if (WaitForSingleObject(self.stopEvent, delay) != WAIT_TIMEOUT) {
         break;
@@ -565,145 +340,274 @@ struct RealtimeCapture {
   }
 };
 
+HWND overlay;
+HWND previousForegroundWindow = NULL;
+
+POINT mouse_pos;
+POINT mouse_pos_client;
+POINT last_pos_client;
+POINT mouse_pos_target;
+POINT overlayViewPortCenter;
+POINT overlayViewPortDelta;
+
+RECT overlayViewPort{};
+
+float frameInterval;
+int virtualLeft, virtualTop, virtualWidth, virtualHeight;
+
+FlashLight flashLight;
+Camera camera;
+
+bool isDragging;
+bool useRealTime = false;
+bool useInputThroughWindow = false;
+
+HDC g_hdc = NULL;
+HGLRC g_glrc = NULL;
+GLuint shader_img;
+GLuint screen_texture;
+GLuint screenVBO, screenVAO, screenEBO;
+
+GLuint screen_upload_pbo[2] = {};
+GLsync screen_upload_fence[2] = {};
+int screen_upload_pbo_index = 0;
+size_t screen_upload_bytes = 0;
+bool screen_mipmaps_dirty = false;
+
+GLuint shader_cursor;
+GLuint cursor_vbo, cursor_vao;
+
+unsigned char pixel[4];
+
+ScreenCaptureBuffer screenCapture;
+
 RealtimeCapture realtimeCapture;
 SystemCursorVisibility systemCursor;
 CursorRecoveryWatchdog cursorRecovery;
 
-void ShutdownCursorControl() {
-  //? shutdown 成功 disarm 清除 arm 标记,不会调用重清理
-  if (systemCursor.shutdown()) cursorRecovery.disarm();
-}
-
-bool ReadDesktopPixel(const POINT& desktopPos, unsigned char* rgba) {
-  HDC screenDC = GetDC(NULL);
-  if (screenDC == NULL) {
-    return false;
-  }
-
-  COLORREF color = GetPixel(screenDC, desktopPos.x, desktopPos.y);
-  ReleaseDC(NULL, screenDC);
-
-  if (color == CLR_INVALID) {
-    return false;
-  }
-
-  rgba[0] = GetRValue(color);
-  rgba[1] = GetGValue(color);
-  rgba[2] = GetBValue(color);
-  rgba[3] = 255;
-  return true;
-}
-
-bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba) {
-  if (screenCapture.pixels == nullptr) return false;
-  // OverlayToCapturePoint returns absolute desktop coordinates. Convert them
-  // to image-local coordinates, including negative multi-monitor origins.
-  const long long x = static_cast<long long>(desktopPos.x) - virtualLeft;
-  const long long y = static_cast<long long>(desktopPos.y) - virtualTop;
-  if (x < 0 || y < 0 || x >= screenCapture.width || y >= screenCapture.height) {
-    return false;
-  }
-
-  const size_t offset =
-      (static_cast<size_t>(screenCapture.height - 1 - y) * screenCapture.width +
-       static_cast<size_t>(x)) *
-      4;
-
-  rgba[0] = screenCapture.pixels[offset + 2];
-  rgba[1] = screenCapture.pixels[offset + 1];
-  rgba[2] = screenCapture.pixels[offset];
-  rgba[3] = 255;  // The fourth byte of a GDI BI_RGB capture is not valid alpha.
-  return true;
-}
-
-bool ReadScreenPixel(const POINT& desktopPos, unsigned char* rgba) {
-  return useRealTime ? ReadDesktopPixel(desktopPos, rgba)
-                     : ReadFrozenImagePixel(desktopPos, rgba);
-}
-
-bool CacheFrozenScreenTexture() {
-  // Read once when leaving realtime mode. Capture buffers may already contain
-  // a newer, not-yet-uploaded frame, so read the actual displayed texture.
-  if (screenCapture.pixels == nullptr || screenCapture.width != virtualWidth ||
-      screenCapture.height != virtualHeight) {
-    screenCapture.shutdown();
-    if (!screenCapture.initialize(virtualWidth, virtualHeight)) return false;
-  }
-  GLint previousTexture = 0, previousPackBuffer = 0;
-
-  //? 查询当前活动单元glActiveTexture使用纹理
-  glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);  // 名称
-  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING,
-                &previousPackBuffer);  // 查询当前绑定buffer
-  const GLenum packing[] = {GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH,
-                            GL_PACK_SKIP_ROWS, GL_PACK_SKIP_PIXELS};
-  GLint previousPacking[4]{};
-  for (int i = 0; i < 4; ++i) {
-    glGetIntegerv(packing[i], &previousPacking[i]);
-    glPixelStorei(packing[i], i == 0 ? 1 : 0);
-  }
-
-  /*
-    只有当 glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); 设置不经过读回 pbo
-    才可以通过glGetTexImage(..., screenCapture.pixels);直接都会内存
-    所以要保存previous GL_PIXEL_PACK_BUFFER_BINDING
-  */
-  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-  glBindTexture(GL_TEXTURE_2D, screen_texture);
-  glGetTexImage(GL_TEXTURE_2D, 0, GL_BGRA, GL_UNSIGNED_BYTE,
-                screenCapture.pixels);
-  const GLenum error = glGetError();
-  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
-  glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(previousPackBuffer));
-  for (int i = 0; i < 4; ++i) glPixelStorei(packing[i], previousPacking[i]);
-  if (error != GL_NO_ERROR) {
-    screenCapture.shutdown();
-    OutputDebugStringA(
-        "winzoomer: failed to cache frozen image for color picking\n");
-    return false;
-  }
-  return true;
-}
-
-//& >>>>>>>>>>>> function
-POINT CaptureToOverlayPoint(const POINT& capturePos);
-POINT OverlayToCapturePoint(const POINT& mouseClient);
-void SimpleRenderOneLine(int x, int y, int scale, Vec3f color,
-                         const char* format, ...);
 LRESULT CALLBACK WindowProcRouter(HWND hwnd, UINT uMsg, WPARAM wParam,
                                   LPARAM lParam);
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+
+void RGBtoHSV(int r, int g, int b, float& h, float& s, float& v);
+bool ReadScreenPixel(const POINT& desktopPos, unsigned char* rgba);
+bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba);
+bool ReadDesktopPixel(const POINT& desktopPos, unsigned char* rgba);
+bool CacheFrozenScreenTexture();
+
+POINT CaptureToOverlayPoint(const POINT& capturePos);
+POINT OverlayToCapturePoint(const POINT& mouseClient);
+
 void SetInputPassthrough(bool enabledInputThrough);
 bool IsMouseInputMessage(UINT message);
 bool IsUserInputMessage(UINT message);
-void checkCompileErrors(GLuint shader, const std::string& type);
-void RGBtoHSV(int r, int g, int b, float& h, float& s, float& v);
 
-GLuint createShader(std::string& vert, std::string& frag);
 bool UpdateScreenTexture();
 void ConfigureScreenTextureFilter(bool realtime);
+
 void SetRealtimeEnabled(bool enabled);
+void ShutdownCursorControl();
+
 void InitializeScreenUploadPbos();
 void ShutdownScreenUploadPbos();
+
+bool IsInsideRect(const RECT& rect, const POINT& src);
+
 void RenderScreen_raw();
 void RenderCursor(POINT renderPos);
-
-#ifdef FREETYPE
-void RenderText(std::string& text, GLfloat x, GLfloat y, GLfloat scale,
-                Vec3f color);
-#endif
 
 void RenderBegin() {
   glViewport(0, 0, virtualWidth, virtualHeight);
   glClearColor(0.1, 0.1, 0.1, 1);
   glClear(GL_COLOR_BUFFER_BIT);
 }
-
 void RenderEnd() { SwapBuffers(g_hdc); }
 
-template <class T>
-T file_path(T const& path, T const& delims = "/\\") {
-  return path.substr(0, path.find_last_of(delims));
+void RenderFrame(float dt, float elapsed) {
+  GetCursorPos(&mouse_pos);
+
+  if (useInputThroughWindow) {
+    // 穿透模式下反过来，映射到 overlay 渲染光标
+    mouse_pos_target = mouse_pos;
+    ScreenToClient(overlay, &mouse_pos_target);
+    mouse_pos_client = CaptureToOverlayPoint(mouse_pos_target);
+    overlayViewPortDelta = {mouse_pos_target.x - overlayViewPortCenter.x,
+                            mouse_pos_target.y - overlayViewPortCenter.y};
+    if (!IsInsideRect(overlayViewPort, mouse_pos_target)) {
+      camera.velocity =
+          Vec2f(overlayViewPortDelta.x * OverlayViewPortMoveSpeed,
+                overlayViewPortDelta.y * OverlayViewPortMoveSpeed);
+    }
+  } else {
+    // 一般情况下将 overlay 映射到实际的桌面
+    mouse_pos_client = mouse_pos;
+    ScreenToClient(overlay,
+                   &mouse_pos_client);  //! overlay is always fullscreen
+    mouse_pos_target = OverlayToCapturePoint(mouse_pos_client);
+
+    if (last_pos_client.x != mouse_pos_client.x ||
+        last_pos_client.y != mouse_pos_client.y) {
+      if (isDragging) {
+        //? 放大后偏移移动量减小
+        float dx = (last_pos_client.x - mouse_pos_client.x) / camera.scale;
+        float dy = (last_pos_client.y - mouse_pos_client.y) / camera.scale;
+
+        camera.position += Vec2f(dx, dy);
+        camera.velocity = Vec2f(dx * velocity_movement, dy * velocity_movement);
+      }
+      last_pos_client.x = mouse_pos_client.x;
+      last_pos_client.y = mouse_pos_client.y;
+    }
+  }
+  camera.update(Vec2f(virtualWidth, virtualHeight), dt, isDragging);
+
+  if (!useInputThroughWindow) {
+    // Match the camera used to draw this frame, including pan/zoom inertia.
+    mouse_pos_target = OverlayToCapturePoint(mouse_pos_client);
+  }
+  POINT viewPortLT = OverlayToCapturePoint(POINT{virtualLeft, virtualTop});
+  POINT viewPortRB = OverlayToCapturePoint(
+      POINT{virtualLeft + virtualWidth - 1, virtualTop + virtualHeight - 1});
+
+  overlayViewPort.left = viewPortLT.x;
+  overlayViewPort.top = viewPortLT.y;
+  overlayViewPort.right = viewPortRB.x;
+  overlayViewPort.bottom = viewPortRB.y;
+  overlayViewPortCenter.x =
+      (overlayViewPort.left + overlayViewPort.right) * 0.5;
+  overlayViewPortCenter.y =
+      (overlayViewPort.top + overlayViewPort.bottom) * 0.5;
+
+  flashLight.update(dt);
+
+  if (useRealTime) {
+    UpdateScreenTexture();
+  }
+
+  RenderBegin();
+  RenderScreen_raw();
+
+  if (flashLight.isEnabled) {
+#ifdef FREETYPE
+    const POINT samplePos =
+        useInputThroughWindow ? mouse_pos : mouse_pos_target;
+    const bool pixelValid = ReadScreenPixel(samplePos, pixel);
+    if (!pixelValid) std::memset(pixel, 0, sizeof(pixel));
+
+    int r = pixel[0];
+    int g = pixel[1];
+    int b = pixel[2];
+
+    float h, s, v;
+    RGBtoHSV(r, g, b, h, s, v);
+    float tx = 25.0f;
+    float ty = 20.0f;
+    float scale = 1.0f;
+    float padding = PIXEL_HEIGHT * scale * 2;
+
+#ifdef DEBUG
+    Vec3f color = Vec3f(255.0f, 255.0f, 255.0f);
+#else
+    Vec3f color = Vec3f(r / 255.0f, g / 255.0f, b / 255.0f);
+#endif
+    if (pixelValid) {
+      SimpleRenderOneLine(tx, ty, scale, color, virtualWidth, virtualHeight,
+                          "RGB: %d %d %d", r, g, b);
+      ty += padding;
+
+      SimpleRenderOneLine(tx, ty, scale, color, virtualWidth, virtualHeight,
+                          "HEX: #%02X%02X%02X", r, g, b);
+      ty += padding;
+
+      SimpleRenderOneLine(tx, ty, scale, color, virtualWidth, virtualHeight,
+                          "HSV: (%.0f°, %.0f%%, %.0f%%)", h, s * 100, v * 100);
+    } else {
+      SimpleRenderOneLine(tx, ty, scale, Vec3f(1, 1, 1), virtualWidth,
+                          virtualHeight, "Color: N/A");
+    }
+
+#ifdef DEBUG
+    ty += padding;
+    SimpleRenderOneLine(tx, ty, scale, color, virtualWidth, virtualHeight,
+                        "<<< camerapos.x=%d camerapos.y=%d scale=%f >>>",
+                        (int)camera.position.x, (int)camera.position.y,
+                        camera.scale);
+    ty += padding;
+
+    SimpleRenderOneLine(tx, ty, scale, color, virtualWidth, virtualHeight,
+                        "<<< mousepos.x=%d mousepos.y=%d>>>", (int)mouse_pos.x,
+                        (int)mouse_pos.y);
+    ty += padding;
+
+    SimpleRenderOneLine(tx, ty, scale, color, virtualWidth, virtualHeight,
+                        "<<< real time mode: %s >>>",
+                        useRealTime ? "on" : "off");
+    ty += padding;
+
+    SimpleRenderOneLine(tx, ty, scale, color, virtualWidth, virtualHeight,
+                        "<<< targetPos.x=%d targetPos.y=%d>>>",
+                        mouse_pos_target.x, mouse_pos_target.y);
+    ty += padding;
+
+    SimpleRenderOneLine(tx, ty, scale, color, virtualWidth, virtualHeight,
+                        "<<< mouse_pos_client.x=%d mouse_pos_client.y=%d>>>",
+                        (int)mouse_pos_client.x + virtualLeft,
+                        (int)mouse_pos_client.y + virtualTop);
+    ty += padding;
+
+    SimpleRenderOneLine(
+        tx, ty, scale, color, virtualWidth, virtualHeight,
+        "<<< overlayViewPort left=%ld top=%ld right=%ld bottom=%ld >>>",
+        overlayViewPort.left, overlayViewPort.top, overlayViewPort.right,
+        overlayViewPort.bottom);
+
+    ty += padding;
+    SimpleRenderOneLine(tx, ty, scale, color, virtualWidth, virtualHeight,
+                        "<<< overlayViewPortDelta dx=%ld dy=%ld >>>",
+                        overlayViewPortDelta.x, overlayViewPortDelta.y);
+#endif
+#endif
+  }
+  RenderCursor(mouse_pos_client);
+  RenderEnd();
+}
+
+double NowSeconds() {
+  static const double frequency = [] {
+    LARGE_INTEGER value;
+    QueryPerformanceFrequency(&value);
+    return double(value.QuadPart);
+  }();
+
+  LARGE_INTEGER value;
+  QueryPerformanceCounter(&value);
+
+  return double(value.QuadPart) / frequency;
+}
+
+HANDLE CreateFrameTimer() {
+  HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
+                                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                        TIMER_MODIFY_STATE | SYNCHRONIZE);
+  if (timer == nullptr) {
+    timer = CreateWaitableTimerW(nullptr,
+                                 FALSE,  // 自动复位
+                                 nullptr);
+  }
+
+  return timer;
+}
+
+bool ArmOneShotTimer(HANDLE timer, double seconds) {
+  LARGE_INTEGER due;
+
+  // 单位为 100ns；负数表示相对等待时间。
+  due.QuadPart = -std::max(1LL, (long long)ceil(seconds * 10000000.0));
+
+  return SetWaitableTimer(timer, &due,
+                          0,                 // 只触发一次
+                          nullptr, nullptr,  // 不使用回调
+                          FALSE) != FALSE;
 }
 
 /*?
@@ -810,9 +714,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   flashLight.radius = 100.0f;
   flashLight.deltaRadius = 0.0f;
   flashLight.isEnabled = false;
-  dt = (float)1 / rate;
+  frameInterval = (float)1 / FPS;
 
-  SetTimer(overlay, REFRESH_TIMER_ID, 16, NULL);
 
   g_hdc = GetDC(overlay);
   PIXELFORMATDESCRIPTOR pfd = {sizeof(PIXELFORMATDESCRIPTOR)};
@@ -840,36 +743,44 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     return 1;
   }
 
+  // shader
   shader_img = createShader(vertexShader, fragmentShader);
+  if (shader_img == 0) {
+    return 1;
+  }
 
+  shader_cursor = createShader(cursorVertShader, cursorFragShader);
+  if (shader_cursor == 0) {
+    return 1;
+  }
+
+  if (!screenCapture.initialize(virtualWidth, virtualHeight) ||
+      !screenCapture.capture(virtualLeft, virtualTop)) {
+    MessageBoxA(NULL, "failed to capture the virtual screen", "Error",
+                MB_OK | MB_ICONERROR);
+    screenCapture.shutdown();
+    return 1;
+  }
+
+#ifdef FREETYPE
+  if (!InitFreetype()) return 1;
+#endif  // FREETYPE
+
+  // clang-format off
+  float vertices[] = {
+      0, 0, 0, 0, 0,  // top left
+      (float)virtualWidth, 0, 0, 1, 0,  // top right
+      0, (float)virtualHeight, 0, 0, 1,  // bottom left
+      (float)virtualWidth, (float)virtualHeight, 0, 1, 1  // bottom right
+  };
+  unsigned int indices[] = {0, 1, 2, 1, 2, 3};
+  // clang-format on
+
+  // screen vao
   glGenTextures(1, &screen_texture);
   glGenBuffers(1, &screenVBO);
   glGenVertexArrays(1, &screenVAO);
   glGenBuffers(1, &screenEBO);
-
-  float vertices[] = {
-      0,
-      0,
-      0,
-      0,
-      0,  // top left
-      (float)virtualWidth,
-      0,
-      0,
-      1,
-      0,  // top right
-      0,
-      (float)virtualHeight,
-      0,
-      0,
-      1,  // bottom left
-      (float)virtualWidth,
-      (float)virtualHeight,
-      0,
-      1,
-      1  // bottom right
-  };
-  unsigned int indices[] = {0, 1, 2, 1, 2, 3};
 
   glBindVertexArray(screenVAO);
   glBindBuffer(GL_ARRAY_BUFFER, screenVBO);
@@ -886,14 +797,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                         (void*)(3 * sizeof(float)));
   glEnableVertexAttribArray(1);
 
-  if (!screenCapture.initialize(virtualWidth, virtualHeight) ||
-      !screenCapture.capture(virtualLeft, virtualTop)) {
-    MessageBoxA(NULL, "failed to capture the virtual screen", "Error",
-                MB_OK | MB_ICONERROR);
-    screenCapture.shutdown();
-    return 1;
-  }
-
+  // texture
   glBindTexture(GL_TEXTURE_2D, screen_texture);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, virtualWidth, virtualHeight, 0,
                GL_BGRA, GL_UNSIGNED_BYTE, screenCapture.pixels);
@@ -909,91 +813,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   glBindTexture(GL_TEXTURE_2D, 0);
   glBindVertexArray(0);
 
-  // Keep this DIB for static-image picking. The capture worker owns separate
-  // buffers and never writes screenCapture while the fixed image is displayed.
-
   float ratio[2] = {(float)virtualWidth, (float)virtualHeight};
   glUseProgram(shader_img);
   glUniform2fv(glGetUniformLocation(shader_img, "uResolution"), 1, ratio);
   glUniform2fv(glGetUniformLocation(shader_img, "windowSize"), 1, ratio);
 
-#ifdef FREETYPE
-  // https://learnopengl-cn.github.io/06%20In%20Practice/02%20Text%20Rendering/
-  char pathBuf[BUF_SIZE] = {};
-  GetModuleFileNameA(NULL, pathBuf, BUF_SIZE);
-  std::string path(pathBuf);
-
-  auto exePath = file_path(path);
-  auto fontPath = file_path(exePath) + "\\fonts\\Px437_Acer_VGA_8x8.ttf";
-  FT_Library ft;
-  FT_Face face;
-
-  if (FT_Init_FreeType(&ft)) {
-    MessageBoxA(NULL, "ERROR::FREETYPE: Could not init FreeType Library",
-                "Error", MB_OK | MB_ICONERROR);
-    return 1;
-  }
-  if (FT_New_Face(ft, fontPath.c_str(), 0, &face)) {
-    std::string msgerr("failed to load font:");
-    msgerr += fontPath;
-    MessageBoxA(NULL, msgerr.c_str(), "ERROR", MB_OK | MB_ICONERROR);
-    return 1;
-  }
-
-  FT_Set_Pixel_Sizes(face, 0, pixel_height);
-
-  shader_txt = createShader(textVertShader, textfragmentShader);
-
-  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-
-  for (GLubyte c = 0; c < 128; c++) {
-    if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
-      continue;
-    }
-
-    GLuint txture;
-    glGenTextures(1, &txture);
-    glBindTexture(GL_TEXTURE_2D, txture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, face->glyph->bitmap.width,
-                 face->glyph->bitmap.rows, 0, GL_RED, GL_UNSIGNED_BYTE,
-                 face->glyph->bitmap.buffer);
-
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-    Character character = {
-        txture, Vec2i(face->glyph->bitmap.width, face->glyph->bitmap.rows),
-        Vec2i(face->glyph->bitmap_left, face->glyph->bitmap_top),
-        face->glyph->advance.x};
-
-    Characters.insert(std::pair<GLchar, Character>(c, character));
-  }
-
-  glBindTexture(GL_TEXTURE_2D, 0);
-
-  FT_Done_Face(face);
-  FT_Done_FreeType(ft);
-
-  glEnable(GL_BLEND);
-  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-  glGenVertexArrays(1, &textVAO);
-  glGenBuffers(1, &textVBO);
-
-  glBindVertexArray(textVAO);
-  glBindBuffer(GL_ARRAY_BUFFER, textVBO);
-  glBufferData(GL_ARRAY_BUFFER, sizeof(GLfloat) * 6 * 4, NULL, GL_DYNAMIC_DRAW);
-
-  glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), 0);
-  glEnableVertexAttribArray(0);
-
-  glBindVertexArray(0);
-#endif
-
-  //& cursor shader
-  shader_cursor = createShader(cursorVertShader, cursorFragShader);
+  // cursor vao
   glGenVertexArrays(1, &cursor_vao);
   glGenBuffers(1, &cursor_vbo);
 
@@ -1012,34 +837,47 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   mouse_pos_target = OverlayToCapturePoint(mouse_pos_client);
 
   MSG msg = {};
-  while (true) {
-    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+  bool running = true;
+  HANDLE frameTimer = CreateFrameTimer();
+  const int waitEventCount = 128;
+
+  double start = NowSeconds();
+  double previousFrame = start - frameInterval;
+  double nextFrame = start;
+
+  auto quit = [&frameTimer, &running]() {
+    ShutdownCursorControl();
+    UnregisterHotKey(NULL, QUIT_KEY_ID2);
+    UnregisterHotKey(NULL, QUIT_KEY_ID);
+    UnregisterHotKey(NULL, TOGGLE_INPUT_HOTKEY_ID);
+    realtimeCapture.stop();
+    screenCapture.shutdown();
+
+    glDeleteBuffers(1, &screenVBO);
+    glDeleteBuffers(1, &screenEBO);
+    glDeleteVertexArrays(1, &screenVAO);
+    ShutdownScreenUploadPbos();
+    CloseHandle(frameTimer);
+#ifdef FREETYPE
+    ClearFreetype();
+#endif  // FREETYPE
+    glDeleteTextures(1, &screen_texture);
+    wglMakeCurrent(NULL, NULL);
+    wglDeleteContext(g_glrc);
+    ReleaseDC(overlay, g_hdc);
+    running = false;
+  };
+
+  while (running) {
+    for (int i = 0; i < waitEventCount; ++i) {
+      if (!PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+        break;
+      }
+
       if (msg.message == WM_QUIT) {
         // Restore immediately, before joining the capture worker or GL cleanup.
-        ShutdownCursorControl();
-        KillTimer(overlay, REFRESH_TIMER_ID);
-        UnregisterHotKey(NULL, QUIT_KEY_ID2);
-        UnregisterHotKey(NULL, QUIT_KEY_ID);
-        UnregisterHotKey(NULL, TOGGLE_INPUT_HOTKEY_ID);
-        realtimeCapture.stop();
-        screenCapture.shutdown();
-
-        glDeleteBuffers(1, &screenVBO);
-        glDeleteBuffers(1, &screenEBO);
-        glDeleteVertexArrays(1, &screenVAO);
-        ShutdownScreenUploadPbos();
-
-#ifdef FREETYPE
-        glDeleteBuffers(1, &textVBO);
-        glDeleteVertexArrays(1, &textVAO);
-#endif
-
-        glDeleteTextures(1, &screen_texture);
-        wglMakeCurrent(NULL, NULL);
-        wglDeleteContext(g_glrc);
-        ReleaseDC(overlay, g_hdc);
-
-        return 0;
+        running = false;
+        break;
       }
       if (msg.message == WM_HOTKEY && msg.wParam == QUIT_KEY_ID) {
         PostQuitMessage(0);
@@ -1057,23 +895,48 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
       DispatchMessage(&msg);
     }
 
-    MsgWaitForMultipleObjectsEx(0, NULL, INFINITE, QS_ALLINPUT,
-                                MWMO_INPUTAVAILABLE);
+    if (!running) break;
+
+    double now = NowSeconds();
+    if (now >= nextFrame) {
+      // for the first time  now > start  elapsed = now - previousFrame >
+      // frameinterval
+      double elapsed = now - previousFrame;
+      previousFrame = now;
+      float dt = float(std::min(elapsed, 0.1));
+      RenderFrame(dt, elapsed);
+      nextFrame = now + frameInterval;
+      continue;
+    }
+
+    double remaining = nextFrame - NowSeconds();
+    if (remaining <= 0) continue;
+
+    if (!ArmOneShotTimer(frameTimer, remaining)) {
+      running = false;
+      break;
+    }
+
+    DWORD result = MsgWaitForMultipleObjectsEx(
+        1, &frameTimer, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+
+    if (result == WAIT_FAILED) {
+      // 记录失败，退出循环，执行正常清理。
+      running = false;
+      break;
+    }
   }
 
+  quit();
   return 0;
 }
 
 LRESULT CALLBACK WindowProcRouter(HWND hwnd, UINT uMsg, WPARAM wParam,
                                   LPARAM lParam) {
-  // Filter user input only. Internal messages such as WM_TIMER, WM_PAINT,
-  // WM_SIZE, WM_INPUT, and WM_DESTROY must still reach WindowProc.
   if (!useInputThroughWindow || !IsUserInputMessage(uMsg)) {
     return WindowProc(hwnd, uMsg, wParam, lParam);
   }
 
-  // Keep internal messages such as WM_TIMER flowing through WindowProc, but
-  // make the overlay transparent to mouse hit-testing and activation.
   if (uMsg == WM_NCHITTEST) {
     return HTTRANSPARENT;
   }
@@ -1395,155 +1258,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
       camera.scalePivot = Vec2f((float)mouse_pos.x, (float)mouse_pos.y);
       return 0;
     }
-    case WM_TIMER: {
-      GetCursorPos(&mouse_pos);
-
-      if (useInputThroughWindow) {
-        // 穿透模式下反过来，映射到 overlay 渲染光标
-        mouse_pos_target = mouse_pos;
-        ScreenToClient(overlay, &mouse_pos_target);
-        mouse_pos_client = CaptureToOverlayPoint(mouse_pos_target);
-        overlayViewPortDelta = {mouse_pos_target.x - overlayViewPortCenter.x,
-                                mouse_pos_target.y - overlayViewPortCenter.y};
-        if (!IsInsideRect(overlayViewPort, mouse_pos_target)) {
-          camera.velocity =
-              Vec2f(overlayViewPortDelta.x * OverlayViewPortMoveSpeed,
-                    overlayViewPortDelta.y * OverlayViewPortMoveSpeed);
-        }
-      } else {
-        // 一般情况下将 overlay 映射到实际的桌面
-        mouse_pos_client = mouse_pos;
-        ScreenToClient(overlay,
-                       &mouse_pos_client);  //! overlay is always fullscreen
-        mouse_pos_target = OverlayToCapturePoint(mouse_pos_client);
-
-        if (last_pos_client.x != mouse_pos_client.x ||
-            last_pos_client.y != mouse_pos_client.y) {
-          if (isDragging) {
-            //? 放大后偏移移动量减小
-            float dx = (last_pos_client.x - mouse_pos_client.x) / camera.scale;
-            float dy = (last_pos_client.y - mouse_pos_client.y) / camera.scale;
-
-            camera.position += Vec2f(dx, dy);
-            camera.velocity = Vec2f(dx * rate, dy * rate);
-          }
-          last_pos_client.x = mouse_pos_client.x;
-          last_pos_client.y = mouse_pos_client.y;
-        }
-      }
-
-      camera.update(Vec2f(virtualWidth, virtualHeight), dt, isDragging);
-      if (!useInputThroughWindow) {
-        // Match the camera used to draw this frame, including pan/zoom inertia.
-        mouse_pos_target = OverlayToCapturePoint(mouse_pos_client);
-      }
-      POINT viewPortLT = OverlayToCapturePoint(POINT{virtualLeft, virtualTop});
-      POINT viewPortRB = OverlayToCapturePoint(POINT{
-          virtualLeft + virtualWidth - 1, virtualTop + virtualHeight - 1});
-
-      overlayViewPort.left = viewPortLT.x;
-      overlayViewPort.top = viewPortLT.y;
-      overlayViewPort.right = viewPortRB.x;
-      overlayViewPort.bottom = viewPortRB.y;
-      overlayViewPortCenter.x =
-          (overlayViewPort.left + overlayViewPort.right) * 0.5;
-      overlayViewPortCenter.y =
-          (overlayViewPort.top + overlayViewPort.bottom) * 0.5;
-
-      flashLight.update(dt);
-
-      if (useRealTime) {
-        UpdateScreenTexture();
-      }
-
-      RenderBegin();
-      RenderScreen_raw();
-
-      if (flashLight.isEnabled) {
-#ifdef FREETYPE
-        const POINT samplePos =
-            useInputThroughWindow ? mouse_pos : mouse_pos_target;
-        const bool pixelValid = ReadScreenPixel(samplePos, pixel);
-        if (!pixelValid) std::memset(pixel, 0, sizeof(pixel));
-
-        int r = pixel[0];
-        int g = pixel[1];
-        int b = pixel[2];
-
-        float h, s, v;
-        RGBtoHSV(r, g, b, h, s, v);
-        float tx = 25.0f;
-        float ty = 20.0f;
-        float scale = 1.0f;
-        float padding = pixel_height * scale * 2;
-
-#ifdef DEBUG
-        Vec3f color = Vec3f(255.0f, 255.0f, 255.0f);
-#else
-        Vec3f color = Vec3f(r / 255.0f, g / 255.0f, b / 255.0f);
-#endif
-
-        if (pixelValid) {
-          SimpleRenderOneLine(tx, ty, scale, color, "RGB: %d %d %d", r, g, b);
-          ty += padding;
-
-          SimpleRenderOneLine(tx, ty, scale, color, "HEX: #%02X%02X%02X", r, g,
-                              b);
-          ty += padding;
-
-          SimpleRenderOneLine(tx, ty, scale, color,
-                              "HSV: (%.0f°, %.0f%%, %.0f%%)", h, s * 100,
-                              v * 100);
-        } else {
-          SimpleRenderOneLine(tx, ty, scale, Vec3f(1, 1, 1), "Color: N/A");
-        }
-#ifdef DEBUG
-        ty += padding;
-        SimpleRenderOneLine(tx, ty, scale, color,
-                            "<<< camerapos.x=%d camerapos.y=%d scale=%f >>>",
-                            (int)camera.position.x, (int)camera.position.y,
-                            camera.scale);
-        ty += padding;
-
-        SimpleRenderOneLine(tx, ty, scale, color,
-                            "<<< mousepos.x=%d mousepos.y=%d>>>",
-                            (int)mouse_pos.x, (int)mouse_pos.y);
-        ty += padding;
-
-        SimpleRenderOneLine(tx, ty, scale, color, "<<< real time mode: %s >>>",
-                            useRealTime ? "on" : "off");
-        ty += padding;
-
-        SimpleRenderOneLine(tx, ty, scale, color,
-                            "<<< targetPos.x=%d targetPos.y=%d>>>",
-                            mouse_pos_target.x, mouse_pos_target.y);
-        ty += padding;
-
-        SimpleRenderOneLine(
-            tx, ty, scale, color,
-            "<<< mouse_pos_client.x=%d mouse_pos_client.y=%d>>>",
-            (int)mouse_pos_client.x + virtualLeft,
-            (int)mouse_pos_client.y + virtualTop);
-        ty += padding;
-
-        SimpleRenderOneLine(
-            tx, ty, scale, color,
-            "<<< overlayViewPort left=%ld top=%ld right=%ld bottom=%ld >>>",
-            overlayViewPort.left, overlayViewPort.top, overlayViewPort.right,
-            overlayViewPort.bottom);
-
-        ty += padding;
-        SimpleRenderOneLine(tx, ty, scale, color,
-                            "<<< overlayViewPortDelta dx=%ld dy=%ld >>>",
-                            overlayViewPortDelta.x, overlayViewPortDelta.y);
-#endif
-#endif
-      }
-      RenderCursor(mouse_pos_client);
-      RenderEnd();
-
-      return 0;
-    }
     case WM_ERASEBKGND: {
       return 1;
     }
@@ -1551,25 +1265,100 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
   return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-void SimpleRenderOneLine(int x, int y, int scale, Vec3f color,
-                         const char* format, ...) {
-  va_list args;
-  va_start(args, format);
+void ShutdownCursorControl() {
+  //? shutdown 成功 disarm 清除 arm 标记,不会调用重清理
+  if (systemCursor.shutdown()) cursorRecovery.disarm();
+}
 
-  va_list argsCopy;
-  va_copy(argsCopy, args);
-  int length = std::vsnprintf(nullptr, 0, format, argsCopy);
-  va_end(argsCopy);  //? 只能用一次
-  if (length <= 0) return;
+bool ReadDesktopPixel(const POINT& desktopPos, unsigned char* rgba) {
+  HDC screenDC = GetDC(NULL);
+  if (screenDC == NULL) {
+    return false;
+  }
 
-  std::string result(length + 1, '\0');
-  va_copy(argsCopy, args);
+  COLORREF color = GetPixel(screenDC, desktopPos.x, desktopPos.y);
+  ReleaseDC(NULL, screenDC);
 
-  std::vsnprintf(result.data(), result.size(), format, argsCopy);
+  if (color == CLR_INVALID) {
+    return false;
+  }
 
-  va_end(argsCopy);
+  rgba[0] = GetRValue(color);
+  rgba[1] = GetGValue(color);
+  rgba[2] = GetBValue(color);
+  rgba[3] = 255;
+  return true;
+}
 
-  RenderText(result, x, y, scale, color);
+bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba) {
+  if (screenCapture.pixels == nullptr) return false;
+  // OverlayToCapturePoint returns absolute desktop coordinates. Convert them
+  // to image-local coordinates, including negative multi-monitor origins.
+  const long long x = static_cast<long long>(desktopPos.x) - virtualLeft;
+  const long long y = static_cast<long long>(desktopPos.y) - virtualTop;
+  if (x < 0 || y < 0 || x >= screenCapture.width || y >= screenCapture.height) {
+    return false;
+  }
+
+  const size_t offset =
+      (static_cast<size_t>(screenCapture.height - 1 - y) * screenCapture.width +
+       static_cast<size_t>(x)) *
+      4;
+
+  rgba[0] = screenCapture.pixels[offset + 2];
+  rgba[1] = screenCapture.pixels[offset + 1];
+  rgba[2] = screenCapture.pixels[offset];
+  rgba[3] = 255;  // The fourth byte of a GDI BI_RGB capture is not valid alpha.
+  return true;
+}
+
+bool ReadScreenPixel(const POINT& desktopPos, unsigned char* rgba) {
+  return useRealTime ? ReadDesktopPixel(desktopPos, rgba)
+                     : ReadFrozenImagePixel(desktopPos, rgba);
+}
+
+bool CacheFrozenScreenTexture() {
+  // Read once when leaving realtime mode. Capture buffers may already contain
+  // a newer, not-yet-uploaded frame, so read the actual displayed texture.
+  if (screenCapture.pixels == nullptr || screenCapture.width != virtualWidth ||
+      screenCapture.height != virtualHeight) {
+    screenCapture.shutdown();
+    if (!screenCapture.initialize(virtualWidth, virtualHeight)) return false;
+  }
+  GLint previousTexture = 0, previousPackBuffer = 0;
+
+  //? 查询当前活动单元glActiveTexture使用纹理
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);  // 名称
+  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING,
+                &previousPackBuffer);  // 查询当前绑定buffer
+  const GLenum packing[] = {GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH,
+                            GL_PACK_SKIP_ROWS, GL_PACK_SKIP_PIXELS};
+  GLint previousPacking[4]{};
+  for (int i = 0; i < 4; ++i) {
+    glGetIntegerv(packing[i], &previousPacking[i]);
+    glPixelStorei(packing[i], i == 0 ? 1 : 0);
+  }
+
+  /*
+    只有当 glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); 设置不经过读回 pbo
+    才可以通过glGetTexImage(..., screenCapture.pixels);直接都会内存
+    所以要保存previous GL_PIXEL_PACK_BUFFER_BINDING
+  */
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  glBindTexture(GL_TEXTURE_2D, screen_texture);
+  glGetTexImage(GL_TEXTURE_2D, 0, GL_BGRA, GL_UNSIGNED_BYTE,
+                screenCapture.pixels);
+  const GLenum error = glGetError();
+  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(previousPackBuffer));
+  for (int i = 0; i < 4; ++i) glPixelStorei(packing[i], previousPacking[i]);
+  if (error != GL_NO_ERROR) {
+    screenCapture.shutdown();
+    OutputDebugStringA(
+        "winzoomer: failed to cache frozen image for color picking\n");
+    return false;
+  }
+  return true;
 }
 
 void RGBtoHSV(int r, int g, int b, float& h, float& s, float& v) {
@@ -1748,60 +1537,6 @@ bool UpdateScreenTexture() {
   return true;
 }
 
-void checkCompileErrors(GLuint shader, const std::string& type) {
-  GLint success;
-  char infoLog[2048];
-  ZeroMemory(infoLog, sizeof(infoLog));
-
-  if (type != "PROGRAM") {
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-      glGetShaderInfoLog(shader, sizeof(infoLog), NULL, infoLog);
-
-      std::string msg = "Shader Compilation Error (" + type + ")\n\n";
-      msg += infoLog;
-
-      MessageBoxA(NULL, msg.c_str(), "GLSL Error", MB_OK | MB_ICONERROR);
-    }
-  } else {
-    glGetProgramiv(shader, GL_LINK_STATUS, &success);
-    if (!success) {
-      glGetProgramInfoLog(shader, sizeof(infoLog), NULL, infoLog);
-
-      std::string msg = "Program Linking Error (" + type + ")\n\n";
-      msg += infoLog;
-
-      MessageBoxA(NULL, msg.c_str(), "GLSL Error", MB_OK | MB_ICONERROR);
-    }
-  }
-}
-
-GLuint createShader(std::string& vert, std::string& frag) {
-  GLuint vertex, fragment;
-
-  vertex = glCreateShader(GL_VERTEX_SHADER);
-  const char* vertSrc = vert.c_str();
-  glShaderSource(vertex, 1, &vertSrc, NULL);
-  glCompileShader(vertex);
-  checkCompileErrors(vertex, "VERTEX");
-
-  const char* fragSrc = frag.c_str();
-  fragment = glCreateShader(GL_FRAGMENT_SHADER);
-  glShaderSource(fragment, 1, &fragSrc, NULL);
-  glCompileShader(fragment);
-  checkCompileErrors(fragment, "FRAGMENT");
-
-  GLuint ID = glCreateProgram();
-  glAttachShader(ID, vertex);
-  glAttachShader(ID, fragment);
-  glLinkProgram(ID);
-  checkCompileErrors(ID, "PROGRAM");
-
-  glDeleteShader(vertex);
-  glDeleteShader(fragment);
-  return ID;
-}
-
 void RenderScreen_raw() {
   glUseProgram(shader_img);
 
@@ -1855,45 +1590,3 @@ void RenderCursor(POINT renderPos) {
 
   glDrawArrays(GL_TRIANGLES, 0, 6);
 }
-
-#ifdef FREETYPE
-void RenderText(std::string& text, GLfloat x, GLfloat y, GLfloat scale,
-                Vec3f color) {
-  glUseProgram(shader_txt);
-
-  glActiveTexture(GL_TEXTURE0);
-  glBindVertexArray(textVAO);
-  Mat4 projection = ortho(0, virtualWidth, 0, virtualHeight);
-
-  glUniform1i(glGetUniformLocation(shader_txt, "text"), 0);
-  glUniform3f(glGetUniformLocation(shader_txt, "textColor"), color.x, color.y,
-              color.z);
-  glUniformMatrix4fv(glGetUniformLocation(shader_txt, "projection"), 1,
-                     GL_FALSE, projection.m);
-
-  std::string::const_iterator c;
-  for (c = text.begin(); c != text.end(); c++) {
-    Character ch = Characters[*c];
-
-    GLfloat xpos = x + ch.Bearing.x * scale;
-    GLfloat ypos = y - (ch.Size.y - ch.Bearing.y) * scale;
-
-    GLfloat w = ch.Size.x * scale;
-    GLfloat h = ch.Size.y * scale;
-
-    GLfloat vertices[6][4] = {
-        {xpos, ypos + h, 0.0, 0.0}, {xpos, ypos, 0.0, 1.0},
-        {xpos + w, ypos, 1.0, 1.0}, {xpos, ypos + h, 0.0, 0.0},
-        {xpos + w, ypos, 1.0, 1.0}, {xpos + w, ypos + h, 1.0, 0.0}};
-
-    glBindTexture(GL_TEXTURE_2D, ch.TextureID);
-    glBindBuffer(GL_ARRAY_BUFFER, textVBO);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
-    x += (ch.Advance >> 6) * scale;
-  }
-  glBindVertexArray(0);
-  glBindTexture(GL_TEXTURE_2D, 0);
-}
-#endif
