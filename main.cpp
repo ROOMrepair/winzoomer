@@ -1,10 +1,12 @@
 #include <cassert>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
 #include <string>
+#include <vector>
 #include <handleapi.h>
 #include <libloaderapi.h>
 #include <minwindef.h>
@@ -17,11 +19,13 @@
 #include <math.h>
 #include <ShellScalingApi.h>
 
+#include "monitor_selector.h"
 #include "simpleMath.h"
 #include "simpleText.h"
 #include "simpleShader.h"
 #include "system_cursor.h"
 #include "cursor_recovery.h"
+#include "screenCapture.h"
 
 #include <glad/glad.h>
 #include <winnt.h>
@@ -35,6 +39,7 @@
 #define QUIT_KEY_ID 1
 #define TOGGLE_INPUT_HOTKEY_ID 2
 #define QUIT_KEY_ID2 3
+#define EXCHANGE_SCREEN 4
 
 #define BUF_SIZE 1024
 #define REFRESH_TIMER_ID 1
@@ -93,253 +98,6 @@ typedef struct Camera {
   }
 } Camera;
 
-struct ScreenCaptureBuffer {
-  int width = 0;
-  int height = 0;
-  HDC memoryDC = NULL;
-  HDC screenDC = NULL;
-  HBITMAP bitmap = NULL;
-  HGDIOBJ previousBitmap = NULL;
-  unsigned char* pixels = nullptr;
-
-  bool initialize(int captureWidth, int captureHeight) {
-    width = captureWidth;
-    height = captureHeight;
-
-    memoryDC = CreateCompatibleDC(NULL);
-    if (memoryDC == NULL) {
-      return false;
-    }
-
-    screenDC = GetDC(NULL);
-    if (screenDC == NULL) {
-      shutdown();
-      return false;
-    }
-
-    BITMAPINFO bitmapInfo = {};
-    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    // Keep a bottom-up DIB so the existing OpenGL texture coordinates remain
-    // unchanged (the first row in memory is the bottom row of the desktop).
-    bitmapInfo.bmiHeader.biWidth = width;
-    bitmapInfo.bmiHeader.biHeight = height;
-    bitmapInfo.bmiHeader.biPlanes = 1;
-    bitmapInfo.bmiHeader.biBitCount = 32;
-    bitmapInfo.bmiHeader.biCompression = BI_RGB;
-
-    //? like GetDIBits(HDC,HBITMAP,...)
-    //? 建一张 GDI 能使用的 HBITMAP，同时返回其指针
-    bitmap = CreateDIBSection(NULL, &bitmapInfo, DIB_RGB_COLORS,
-                              reinterpret_cast<void**>(&pixels), NULL, 0);
-    if (bitmap == NULL || pixels == nullptr) {
-      shutdown();
-      return false;
-    }
-
-    //? 用于恢复原状态
-    previousBitmap = SelectObject(memoryDC, bitmap);
-    if (previousBitmap == NULL || previousBitmap == HGDI_ERROR) {
-      previousBitmap = NULL;
-      shutdown();
-      return false;
-    }
-
-    return true;
-  }
-  /*? how to capture screen
-      1. getdc -> create compatiblebitmap of this dc
-      2. bitblt from compatiblebitmap
-      3. 取 pixels
-  */
-  bool capture(int sourceX, int sourceY) {
-    if (memoryDC == NULL || bitmap == NULL || pixels == nullptr) {
-      return false;
-    }
-
-    if (screenDC == NULL) {
-      return false;
-    }
-
-    BOOL copied = BitBlt(memoryDC, 0, 0, width, height, screenDC, sourceX,
-                         sourceY, SRCCOPY);
-    // Complete GDI writes before publishing or reading the DIB's pixels.
-    BOOL flushed = GdiFlush();
-    return copied != FALSE && flushed != FALSE;
-  }
-
-  void shutdown() {
-    if (memoryDC != NULL && previousBitmap != NULL) {
-      SelectObject(memoryDC, previousBitmap);
-    }
-    if (bitmap != NULL) {
-      DeleteObject(bitmap);
-    }
-    if (memoryDC != NULL) {
-      DeleteDC(memoryDC);
-    }
-    if (screenDC != NULL) {
-      ReleaseDC(NULL, screenDC);
-    }
-
-    width = 0;
-    height = 0;
-    memoryDC = NULL;
-    screenDC = NULL;
-    bitmap = NULL;
-    previousBitmap = NULL;
-    pixels = nullptr;
-  }
-};
-
-// The worker owns all GDI resources. The UI/OpenGL thread only leases the
-// latest completed pixel buffer, so neither BitBlt nor the upload can race it.
-struct RealtimeCapture {
-  ScreenCaptureBuffer buffers[3];
-  CRITICAL_SECTION lock;
-  HANDLE worker = NULL;
-  HANDLE stopEvent = NULL;
-  HANDLE wakeEvent = NULL;
-  HANDLE initializedEvent = NULL;
-  std::atomic<bool> enabled{false};
-  bool initialized = false;
-  int ready = -1;
-  int reading = -1;
-  int width = 0, height = 0, left = 0, top = 0;
-
-  RealtimeCapture() { InitializeCriticalSection(&lock); }
-  ~RealtimeCapture() {
-    stop();
-    DeleteCriticalSection(&lock);
-  }
-
-  static DWORD WINAPI run(void* context) {
-    auto& self = *static_cast<RealtimeCapture*>(context);
-    self.initialized = true;
-    for (auto& buffer : self.buffers) {
-      if (!buffer.initialize(self.width, self.height)) {
-        self.initialized = false;
-        break;
-      }
-    }
-    SetEvent(self.initializedEvent);
-
-    HANDLE events[] = {self.stopEvent, self.wakeEvent};
-    while (self.initialized &&
-           WaitForSingleObject(self.stopEvent, 0) == WAIT_TIMEOUT) {
-      if (!self.enabled.load()) {
-        if (WaitForMultipleObjects(2, events, FALSE, INFINITE) !=
-            WAIT_OBJECT_0 + 1) {
-          break;
-        }
-        continue;
-      }
-
-      const DWORD started = GetTickCount();
-      int writing = -1;
-      EnterCriticalSection(&self.lock);
-      //? reading 渲染线程读取中， ready 等待渲染线程读取
-      for (int i = 0; i < 3; ++i) {
-        if (i != self.reading && i != self.ready) {
-          writing = i;
-          break;
-        }
-      }
-      LeaveCriticalSection(&self.lock);
-
-      if (writing >= 0 && self.buffers[writing].capture(self.left, self.top)) {
-        EnterCriticalSection(&self.lock);
-        if (self.enabled.load()) {
-          // Drop the previous ready frame, never queue stale frames.
-          self.ready = writing;
-        }
-        LeaveCriticalSection(&self.lock);
-      }
-
-      //? 控制截图 interval
-      const DWORD elapsed = GetTickCount() - started;
-      const DWORD interval = static_cast<DWORD>(1000.0 / FPS);
-      const DWORD delay = elapsed < interval ? interval - elapsed : 1;
-      if (WaitForSingleObject(self.stopEvent, delay) != WAIT_TIMEOUT) {
-        break;
-      }
-    }
-
-    for (auto& buffer : self.buffers) {
-      buffer.shutdown();
-    }
-    return 0;
-  }
-
-  bool start(int captureWidth, int captureHeight, int sourceX, int sourceY) {
-    if (worker != NULL) {
-      return initialized;
-    }
-    width = captureWidth;
-    height = captureHeight;
-    left = sourceX;
-    top = sourceY;
-    stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    wakeEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-    initializedEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (stopEvent && wakeEvent && initializedEvent) {
-      worker = CreateThread(NULL, 0, run, this, 0, NULL);
-    }
-    if (worker == NULL) {
-      stop();
-      return false;
-    }
-    WaitForSingleObject(initializedEvent, INFINITE);
-    if (!initialized) {
-      stop();
-      return false;
-    }
-    return true;
-  }
-
-  void setEnabled(bool value) {
-    EnterCriticalSection(&lock);
-    enabled.store(value);
-    ready = -1;
-    LeaveCriticalSection(&lock);
-    if (value && wakeEvent) {
-      SetEvent(wakeEvent);
-    }
-  }
-
-  int acquireLatest() {
-    EnterCriticalSection(&lock);
-    const int result = ready;
-    if (result >= 0) {
-      reading = result;
-      ready = -1;
-    }
-    LeaveCriticalSection(&lock);
-    return result;
-  }
-
-  void release() {
-    EnterCriticalSection(&lock);
-    reading = -1;
-    LeaveCriticalSection(&lock);
-  }
-
-  void stop() {
-    if (worker) {
-      SetEvent(stopEvent);
-      WaitForSingleObject(worker, INFINITE);
-      CloseHandle(worker);
-      worker = NULL;
-    }
-    if (stopEvent) CloseHandle(stopEvent);
-    if (wakeEvent) CloseHandle(wakeEvent);
-    if (initializedEvent) CloseHandle(initializedEvent);
-    stopEvent = wakeEvent = initializedEvent = NULL;
-    enabled.store(false);
-    initialized = false;
-    ready = reading = -1;
-  }
-};
-
 HWND overlay;
 HWND previousForegroundWindow = NULL;
 
@@ -368,6 +126,7 @@ GLuint shader_img;
 GLuint screen_texture;
 GLuint screenVBO, screenVAO, screenEBO;
 
+bool pbo_inited = false;
 GLuint screen_upload_pbo[2] = {};
 GLsync screen_upload_fence[2] = {};
 int screen_upload_pbo_index = 0;
@@ -379,19 +138,22 @@ GLuint cursor_vbo, cursor_vao;
 
 unsigned char pixel[4];
 
-ScreenCaptureBuffer screenCapture;
-
+ScreenCaptureBuffer singleScreenCapture;  // for frozen image
 RealtimeCapture realtimeCapture;
+MonitorSelector monitorSeletor;
+
 SystemCursorVisibility systemCursor;
 CursorRecoveryWatchdog cursorRecovery;
 
+//& functions
 LRESULT CALLBACK WindowProcRouter(HWND hwnd, UINT uMsg, WPARAM wParam,
                                   LPARAM lParam);
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
 void RGBtoHSV(int r, int g, int b, float& h, float& s, float& v);
 bool ReadScreenPixel(const POINT& desktopPos, unsigned char* rgba);
-bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba);
+bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba,
+                          MonitorSelector* seletor);
 bool ReadDesktopPixel(const POINT& desktopPos, unsigned char* rgba);
 bool CacheFrozenScreenTexture();
 
@@ -402,19 +164,61 @@ void SetInputPassthrough(bool enabledInputThrough);
 bool IsMouseInputMessage(UINT message);
 bool IsUserInputMessage(UINT message);
 
-bool UpdateScreenTexture();
 void ConfigureScreenTextureFilter(bool realtime);
 
-void SetRealtimeEnabled(bool enabled);
 void ShutdownCursorControl();
 
-void InitializeScreenUploadPbos();
+void SetRealtimeMode(bool nextModeEnable, MonitorSelector* seletor);
+bool UpdateScreenTexture();
+bool InitializeScreenUploadPbos(int width, int height);
+void ReconfigureScreenUploadPbos(int width, int height);
 void ShutdownScreenUploadPbos();
+void ReLoadTextureSize(MonitorSelector* selector, void* pixels);
 
 bool IsInsideRect(const RECT& rect, const POINT& src);
 
-void RenderScreen_raw();
+void RenderScreen_raw(MonitorSelector* selector);
 void RenderCursor(POINT renderPos);
+
+/*!
+   调用这个
+   mainproc 切换显示, cost some time & render freeze
+   set resetevent (这里还要加内容需要等待内部load结束)
+   只在realtime启动时生效
+ */
+bool RebuildRenderScreen(MonitorSelector* seletor, size_t to_select) {
+  if (!seletor) return false;
+
+  seletor->SelectMonitor(to_select);
+
+  singleScreenCapture.shutdown();
+  singleScreenCapture.setup(seletor->selected_screen_rect.Width,
+                            seletor->selected_screen_rect.Height);
+  singleScreenCapture.capture(seletor->selected_screen_rect.Left,
+                              seletor->selected_screen_rect.Top);
+  ReLoadTextureSize(&monitorSeletor, (void*)singleScreenCapture.pixels);
+
+  realtimeCapture.setEnabled(false);
+  realtimeCapture.setLoadEvent();
+
+  realtimeCapture.reading = -1;
+  realtimeCapture.ready = -1;
+  /*! 设置为-1 为了能够在UpdateScreenTexture中提前返回,
+      但是此时realcap线程可能没有进入wait,
+      然后重新修改了reading ready
+      但是UpdateScreenTexture已经通过load限制了,所以应该没问题
+  */
+
+  ReconfigureScreenUploadPbos(seletor->selected_screen_rect.Width,
+                              seletor->selected_screen_rect.Height);
+
+  screen_mipmaps_dirty = true;
+  ConfigureScreenTextureFilter(useRealTime);
+
+  realtimeCapture.isFirstFrame = true;
+
+  return true;
+}
 
 void RenderBegin() {
   glViewport(0, 0, virtualWidth, virtualHeight);
@@ -425,6 +229,9 @@ void RenderEnd() { SwapBuffers(g_hdc); }
 
 void RenderFrame(float dt, float elapsed) {
   GetCursorPos(&mouse_pos);
+
+  // mousepos 是实际的桌面坐标
+  // mousepostarget 是在overlay上的坐标
 
   if (useInputThroughWindow) {
     // 穿透模式下反过来，映射到 overlay 渲染光标
@@ -461,10 +268,6 @@ void RenderFrame(float dt, float elapsed) {
   }
   camera.update(Vec2f(virtualWidth, virtualHeight), dt, isDragging);
 
-  if (!useInputThroughWindow) {
-    // Match the camera used to draw this frame, including pan/zoom inertia.
-    mouse_pos_target = OverlayToCapturePoint(mouse_pos_client);
-  }
   POINT viewPortLT = OverlayToCapturePoint(POINT{virtualLeft, virtualTop});
   POINT viewPortRB = OverlayToCapturePoint(
       POINT{virtualLeft + virtualWidth - 1, virtualTop + virtualHeight - 1});
@@ -485,7 +288,7 @@ void RenderFrame(float dt, float elapsed) {
   }
 
   RenderBegin();
-  RenderScreen_raw();
+  RenderScreen_raw(&monitorSeletor);
 
   if (flashLight.isEnabled) {
 #ifdef FREETYPE
@@ -505,7 +308,7 @@ void RenderFrame(float dt, float elapsed) {
     float scale = 1.0f;
     float padding = PIXEL_HEIGHT * scale * 2;
 
-#ifdef DEBUG
+#if 0
     Vec3f color = Vec3f(255.0f, 255.0f, 255.0f);
 #else
     Vec3f color = Vec3f(r / 255.0f, g / 255.0f, b / 255.0f);
@@ -565,6 +368,20 @@ void RenderFrame(float dt, float elapsed) {
     SimpleRenderOneLine(tx, ty, scale, color, virtualWidth, virtualHeight,
                         "<<< overlayViewPortDelta dx=%ld dy=%ld >>>",
                         overlayViewPortDelta.x, overlayViewPortDelta.y);
+
+    ty += padding;
+    SimpleRenderOneLine(tx, ty, scale, color, virtualWidth, virtualHeight,
+                        "<<< selected monitor index: %d>>>",
+                        monitorSeletor.selected_monitor);
+
+    ty += padding;
+    SimpleRenderOneLine(
+        tx, ty, scale, color, virtualWidth, virtualHeight,
+        "<<< selected monitor rect: left:%d top:%d width:%d height:%d >>>",
+        monitorSeletor.selected_screen_rect.Left,
+        monitorSeletor.selected_screen_rect.Top,
+        monitorSeletor.selected_screen_rect.Width,
+        monitorSeletor.selected_screen_rect.Height);
 #endif
 #endif
   }
@@ -642,6 +459,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
   virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
+  if (!monitorSeletor.InitMonitorSelector(virtualLeft, virtualTop, virtualWidth,
+                                          virtualHeight)) {
+    MessageBoxA(NULL, "failed to init MonitorSelector ", "Error",
+                MB_OK | MB_ICONERROR);
+    return 1;
+  }
+
   overlayViewPort.left = virtualLeft;
   overlayViewPort.top = virtualTop;
   overlayViewPort.right = virtualLeft + virtualWidth;
@@ -670,6 +494,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
   RegisterHotKey(NULL, QUIT_KEY_ID, MOD_CONTROL | MOD_SHIFT, VK_F12);
   RegisterHotKey(NULL, TOGGLE_INPUT_HOTKEY_ID, MOD_CONTROL | MOD_SHIFT, VK_F11);
+  RegisterHotKey(NULL, EXCHANGE_SCREEN, MOD_CONTROL | MOD_SHIFT, VK_F10);
   RegisterHotKey(NULL, QUIT_KEY_ID2, 0, VK_ESCAPE);
 
   overlay = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, WIN_CLASS_NAME,
@@ -716,7 +541,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   flashLight.isEnabled = false;
   frameInterval = (float)1 / FPS;
 
-
   g_hdc = GetDC(overlay);
   PIXELFORMATDESCRIPTOR pfd = {sizeof(PIXELFORMATDESCRIPTOR)};
   pfd.nVersion = 1;
@@ -754,11 +578,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     return 1;
   }
 
-  if (!screenCapture.initialize(virtualWidth, virtualHeight) ||
-      !screenCapture.capture(virtualLeft, virtualTop)) {
+  if (!singleScreenCapture.setup(virtualWidth, virtualHeight) ||
+      !singleScreenCapture.capture(virtualLeft, virtualTop)) {
     MessageBoxA(NULL, "failed to capture the virtual screen", "Error",
                 MB_OK | MB_ICONERROR);
-    screenCapture.shutdown();
+    singleScreenCapture.shutdown();
     return 1;
   }
 
@@ -766,15 +590,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   if (!InitFreetype()) return 1;
 #endif  // FREETYPE
 
-  // clang-format off
-  float vertices[] = {
-      0, 0, 0, 0, 0,  // top left
-      (float)virtualWidth, 0, 0, 1, 0,  // top right
-      0, (float)virtualHeight, 0, 0, 1,  // bottom left
-      (float)virtualWidth, (float)virtualHeight, 0, 1, 1  // bottom right
-  };
   unsigned int indices[] = {0, 1, 2, 1, 2, 3};
-  // clang-format on
 
   // screen vao
   glGenTextures(1, &screen_texture);
@@ -784,7 +600,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
   glBindVertexArray(screenVAO);
   glBindBuffer(GL_ARRAY_BUFFER, screenVBO);
-  glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+  glBufferData(GL_ARRAY_BUFFER, 20 * sizeof(GLfloat), NULL, GL_DYNAMIC_DRAW);
 
   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, screenEBO);
   glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices,
@@ -800,7 +616,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   // texture
   glBindTexture(GL_TEXTURE_2D, screen_texture);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, virtualWidth, virtualHeight, 0,
-               GL_BGRA, GL_UNSIGNED_BYTE, screenCapture.pixels);
+               GL_BGRA, GL_UNSIGNED_BYTE, singleScreenCapture.pixels);
   glGenerateMipmap(GL_TEXTURE_2D);
 
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
@@ -849,9 +665,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     ShutdownCursorControl();
     UnregisterHotKey(NULL, QUIT_KEY_ID2);
     UnregisterHotKey(NULL, QUIT_KEY_ID);
+    UnregisterHotKey(NULL, EXCHANGE_SCREEN);
     UnregisterHotKey(NULL, TOGGLE_INPUT_HOTKEY_ID);
+
     realtimeCapture.stop();
-    screenCapture.shutdown();
+    singleScreenCapture.shutdown();
 
     glDeleteBuffers(1, &screenVBO);
     glDeleteBuffers(1, &screenEBO);
@@ -889,6 +707,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
       }
       if (msg.message == WM_HOTKEY && msg.wParam == TOGGLE_INPUT_HOTKEY_ID) {
         SetInputPassthrough(!useInputThroughWindow);
+        continue;
+      }
+      if (msg.message == WM_HOTKEY && msg.wParam == EXCHANGE_SCREEN) {
+        int sz = monitorSeletor.monitors.size() + 1;
+        std::vector<int> nextList(sz, 0);
+        for (int i = 0; i < sz; ++i) nextList[i] = i;
+        size_t next = (monitorSeletor.selected_monitor + 1) % sz;
+        RebuildRenderScreen(&monitorSeletor, next);
         continue;
       }
       TranslateMessage(&msg);
@@ -1019,11 +845,13 @@ void SetInputPassthrough(bool enabledInputThrough) {
     //? 如果 setHidden 成功进入这里,此时不需要重复restore
     cursorRecovery.disarm();
   }
+
   useInputThroughWindow = enabledInputThrough;
   isDragging = false;
   ReleaseCapture();
+
   if (enabledInputThrough) {
-    SetRealtimeEnabled(true);
+    SetRealtimeMode(true, &monitorSeletor);
     flashLight.isEnabled = false;
   }
 
@@ -1220,12 +1048,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
           flashLight.radius = 100.0f;
           flashLight.deltaRadius = 0.0f;
           flashLight.isEnabled = false;
-          SetRealtimeEnabled(false);
+          SetRealtimeMode(false, &monitorSeletor);
           SetFocus(overlay);
           break;
         }
         case 'U': {
-          SetRealtimeEnabled(!useRealTime);
+          SetRealtimeMode(!useRealTime, &monitorSeletor);
           break;
         }
         default:
@@ -1256,6 +1084,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
       }
       camera.deltaScale += delta;
       camera.scalePivot = Vec2f((float)mouse_pos.x, (float)mouse_pos.y);
+      return 0;
+    }
+    case WM_TIMER: {
       return 0;
     }
     case WM_ERASEBKGND: {
@@ -1290,47 +1121,48 @@ bool ReadDesktopPixel(const POINT& desktopPos, unsigned char* rgba) {
   return true;
 }
 
-bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba) {
-  if (screenCapture.pixels == nullptr) return false;
+bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba,
+                          MonitorSelector* seletor) {
+  if (singleScreenCapture.pixels == nullptr) return false;
   // OverlayToCapturePoint returns absolute desktop coordinates. Convert them
   // to image-local coordinates, including negative multi-monitor origins.
-  const long long x = static_cast<long long>(desktopPos.x) - virtualLeft;
-  const long long y = static_cast<long long>(desktopPos.y) - virtualTop;
-  if (x < 0 || y < 0 || x >= screenCapture.width || y >= screenCapture.height) {
+  const long long x = static_cast<long long>(desktopPos.x) -
+                      monitorSeletor.selected_screen_rect.Left;
+  const long long y = static_cast<long long>(desktopPos.y) -
+                      monitorSeletor.selected_screen_rect.Top;
+  if (x < 0 || y < 0 || x >= singleScreenCapture.width ||
+      y >= singleScreenCapture.height) {
     return false;
   }
 
   const size_t offset =
-      (static_cast<size_t>(screenCapture.height - 1 - y) * screenCapture.width +
+      (static_cast<size_t>(singleScreenCapture.height - 1 - y) *
+           singleScreenCapture.width +
        static_cast<size_t>(x)) *
       4;
 
-  rgba[0] = screenCapture.pixels[offset + 2];
-  rgba[1] = screenCapture.pixels[offset + 1];
-  rgba[2] = screenCapture.pixels[offset];
+  rgba[0] = singleScreenCapture.pixels[offset + 2];
+  rgba[1] = singleScreenCapture.pixels[offset + 1];
+  rgba[2] = singleScreenCapture.pixels[offset];
   rgba[3] = 255;  // The fourth byte of a GDI BI_RGB capture is not valid alpha.
   return true;
 }
 
+// desktop 指实际的桌面坐标
 bool ReadScreenPixel(const POINT& desktopPos, unsigned char* rgba) {
   return useRealTime ? ReadDesktopPixel(desktopPos, rgba)
-                     : ReadFrozenImagePixel(desktopPos, rgba);
+                     : ReadFrozenImagePixel(desktopPos, rgba, &monitorSeletor);
 }
 
+// 直接取当前的capturesize,capturesize 只在rebuild变化
 bool CacheFrozenScreenTexture() {
-  // Read once when leaving realtime mode. Capture buffers may already contain
-  // a newer, not-yet-uploaded frame, so read the actual displayed texture.
-  if (screenCapture.pixels == nullptr || screenCapture.width != virtualWidth ||
-      screenCapture.height != virtualHeight) {
-    screenCapture.shutdown();
-    if (!screenCapture.initialize(virtualWidth, virtualHeight)) return false;
-  }
   GLint previousTexture = 0, previousPackBuffer = 0;
 
   //? 查询当前活动单元glActiveTexture使用纹理
-  glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);  // 名称
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
   glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING,
                 &previousPackBuffer);  // 查询当前绑定buffer
+  //! 这四个属性会影响下面的glGetTexImage,需要修改设置
   const GLenum packing[] = {GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH,
                             GL_PACK_SKIP_ROWS, GL_PACK_SKIP_PIXELS};
   GLint previousPacking[4]{};
@@ -1339,23 +1171,29 @@ bool CacheFrozenScreenTexture() {
     glPixelStorei(packing[i], i == 0 ? 1 : 0);
   }
 
+  //! 保存之前的texture状态，但为什么保存的是这些...
+  // GL_TEXTURE_BINDING_2D: 当前活动纹理单元(activetexture)绑定的纹理
+  // GL_PIXEL_PACK_BUFFER_BINDING: 读出的像素写到 CPU 内存，还是写到 PBO
   /*
-    只有当 glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); 设置不经过读回 pbo
-    才可以通过glGetTexImage(..., screenCapture.pixels);直接都会内存
-    所以要保存previous GL_PIXEL_PACK_BUFFER_BINDING
+    只有当 glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); 表示设置不经过读回 pbo
+    否则pixels 会被解释为 PBO 内的字节偏移，不再是 CPU 地址。
+    此时才可以通过glGetTexImage(..., singleScreenCapture.pixels); 直接读回内存
   */
   glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
   glBindTexture(GL_TEXTURE_2D, screen_texture);
   glGetTexImage(GL_TEXTURE_2D, 0, GL_BGRA, GL_UNSIGNED_BYTE,
-                screenCapture.pixels);
+                singleScreenCapture.pixels);
   const GLenum error = glGetError();
   glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
   glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(previousPackBuffer));
   for (int i = 0; i < 4; ++i) glPixelStorei(packing[i], previousPacking[i]);
   if (error != GL_NO_ERROR) {
-    screenCapture.shutdown();
+    singleScreenCapture.shutdown();
     OutputDebugStringA(
         "winzoomer: failed to cache frozen image for color picking\n");
+    MessageBoxA(NULL,
+                "winzoomer: failed to cache frozen image for color picking",
+                "Error", MB_OK | MB_ICONERROR);
     return false;
   }
   return true;
@@ -1386,39 +1224,72 @@ void RGBtoHSV(int r, int g, int b, float& h, float& s, float& v) {
   v = maxv;
 }
 
-void ConfigureScreenTextureFilter(bool realtime) {
+void ReLoadTextureSize(MonitorSelector* selector, void* pixels) {
+  GLint previousTexture = 0;
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);  // 名称
+  glBindTexture(GL_TEXTURE_2D, screen_texture);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, selector->selected_screen_rect.Width,
+               selector->selected_screen_rect.Height, 0, GL_BGRA,
+               GL_UNSIGNED_BYTE, pixels);
+
+  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+}
+
+void ConfigureScreenTextureFilter(bool useRealtime) {
+  GLint previousTexture = 0;
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);  // 名称
+
   glBindTexture(GL_TEXTURE_2D, screen_texture);
   // Every entry into realtime mode must disable all old mip levels, including
   // the entry via passthrough. Rebuild the chain once when freezing the image.
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-  //? 实时模式使用原图 第 0 层, 使用linear
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, realtime ? 0 : 1000);
-  if (!realtime && screen_mipmaps_dirty) {
+  //? 实时模式使用原图 第 0 层(linear mode)
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, useRealtime ? 0 : 1000);
+  if (!useRealtime && screen_mipmaps_dirty) {
     glGenerateMipmap(GL_TEXTURE_2D);
     screen_mipmaps_dirty = false;
   }
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                  realtime ? GL_LINEAR : GL_LINEAR_MIPMAP_LINEAR);
-  glBindTexture(GL_TEXTURE_2D, 0);
+                  useRealtime ? GL_LINEAR : GL_LINEAR_MIPMAP_LINEAR);
+
+  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
 }
 
-void SetRealtimeEnabled(bool enabled) {
-  if (enabled && !realtimeCapture.start(virtualWidth, virtualHeight,
-                                        virtualLeft, virtualTop)) {
+void SetRealtimeMode(bool nextModeEnable, MonitorSelector* selector) {
+  if (nextModeEnable && !realtimeCapture.start(selector)) {
     OutputDebugStringA("winzoomer: failed to start realtime capture\n");
     return;
   }
-  if (!enabled && useRealTime) {
+
+  // 第一次 userealtime InitializeScreenUploadPbos
+  if (nextModeEnable && !screen_upload_pbo[0]) {
+    if (!InitializeScreenUploadPbos(selector->selected_screen_rect.Width,
+                                    selector->selected_screen_rect.Height)) {
+      OutputDebugStringA(
+          "winzoomer: failed to start realtime capture when "
+          "InitializeScreenUploadPbos\n");
+      return;
+    }
+  }
+
+  if (nextModeEnable == useRealTime) {
+    return;
+  }
+
+  // 当前是realtime,接下来取消, 截取一张图
+  if (!nextModeEnable && useRealTime) {
     realtimeCapture.setEnabled(false);
+    ConfigureScreenTextureFilter(false);
     CacheFrozenScreenTexture();
+    useRealTime = false;
+    return;
   }
-  useRealTime = enabled;
-  if (enabled && !screen_upload_pbo[0]) {
-    InitializeScreenUploadPbos();
+
+  if (nextModeEnable && !useRealTime) {
+    realtimeCapture.setEnabled(true);
+    ConfigureScreenTextureFilter(nextModeEnable);
+    useRealTime = true;
   }
-  //? wakeEvent
-  realtimeCapture.setEnabled(enabled);
-  ConfigureScreenTextureFilter(enabled);
 }
 
 void ShutdownScreenUploadPbos() {
@@ -1431,21 +1302,56 @@ void ShutdownScreenUploadPbos() {
   glDeleteBuffers(2, screen_upload_pbo);
   screen_upload_pbo[0] = screen_upload_pbo[1] = 0;
   screen_upload_pbo_index = 0;
+  pbo_inited = false;
 }
 
-void InitializeScreenUploadPbos() {
-  screen_upload_bytes = static_cast<size_t>(virtualWidth) *
-                        static_cast<size_t>(virtualHeight) * 4;
+bool InitializeScreenUploadPbos(int width, int height) {
+  screen_upload_bytes =
+      static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
   // Old drivers can still use the direct upload path.
   if (!glMapBufferRange || !glFenceSync || !glClientWaitSync || !glDeleteSync ||
       !glGetBufferParameteri64v) {
-    return;
+    return false;
   }
   glGenBuffers(2, screen_upload_pbo);
   bool allocated = screen_upload_pbo[0] != 0 && screen_upload_pbo[1] != 0;
   for (GLuint pbo : screen_upload_pbo) {
     if (!allocated) break;
-    //? 上传数据到gpu使用 unpack 描述pbo
+    //? 上传数据到 gpu 使用 unpack 描述pbo
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER,
+                 static_cast<GLsizeiptr>(screen_upload_bytes), nullptr,
+                 GL_STREAM_DRAW);
+    GLint64 allocatedBytes = 0;
+    glGetBufferParameteri64v(GL_PIXEL_UNPACK_BUFFER, GL_BUFFER_SIZE,
+                             &allocatedBytes);
+    allocated = allocatedBytes == static_cast<GLint64>(screen_upload_bytes);
+  }
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+  if (!allocated) {
+    OutputDebugStringA(
+        "winzoomer: PBO allocation failed, using direct upload\n");
+    ShutdownScreenUploadPbos();
+    return false;
+  }
+  pbo_inited = true;
+  return true;
+}
+
+void ReconfigureScreenUploadPbos(int width, int height) {
+  if (!pbo_inited) return;
+
+  for (int i = 0; i < 2; ++i) {
+    glDeleteSync(screen_upload_fence[i]);
+    screen_upload_fence[i] = nullptr;
+  }
+
+  screen_upload_bytes =
+      static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+
+  bool allocated = screen_upload_pbo[0] != 0 && screen_upload_pbo[1] != 0;
+  for (GLuint pbo : screen_upload_pbo) {
+    if (!allocated) break;
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
     glBufferData(GL_PIXEL_UNPACK_BUFFER,
                  static_cast<GLsizeiptr>(screen_upload_bytes), nullptr,
@@ -1463,7 +1369,15 @@ void InitializeScreenUploadPbos() {
   }
 }
 
+/*! 这里要确保selector, realcap buffer, singlecap buffer, pbo 一致
+    selector: rebuild 同步
+    singlecap buffer 同步
+    pbo 同步
+    realcap buffer 异步，完成后 isloading = false
+    放行
+*/
 bool UpdateScreenTexture() {
+  if (realtimeCapture.isLoading.load()) return true;
   int pboIndex = -1;
   if (screen_upload_pbo[0]) {
     for (int offset = 0; offset < 2; ++offset) {
@@ -1512,15 +1426,30 @@ bool UpdateScreenTexture() {
     }
   }
 
-  //? 提交 pbo -> 纹理的更新请求,glTexSubImage2D 异步
-  //? 当前 pbo 会被占用
+  //? 提交 pbo 只是发送纹理的更新请求, 说明这里glTexSubImage2D 异步
+  //? 这一过程中当前 pbo 会被占用
+  //? glTexSubImage2D 不会删除原来的texture,如果之前是 3000 * 2000,接下来是 2000
+  //* 1000, ? 多余的部分还是存在于 texture 内存空间,此时用 glTexImage2D,
+  // 重新分配一下
+  //+ 最好将 glTexImage2D 单独抽出来  use nullptr 在 single 和 real cap
+  // 之前就设置好
   glBindTexture(GL_TEXTURE_2D, screen_texture);
-  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, virtualWidth, virtualHeight, GL_BGRA,
-                  GL_UNSIGNED_BYTE, staged ? nullptr : pixels);
+  if (realtimeCapture.isFirstFrame) {
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                 monitorSeletor.selected_screen_rect.Width,
+                 monitorSeletor.selected_screen_rect.Height, 0, GL_BGRA,
+                 GL_UNSIGNED_BYTE, staged ? nullptr : pixels);
+    realtimeCapture.isFirstFrame = false;
+  } else {
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                    monitorSeletor.selected_screen_rect.Width,
+                    monitorSeletor.selected_screen_rect.Height, GL_BGRA,
+                    GL_UNSIGNED_BYTE, staged ? nullptr : pixels);
+  }
   if (staged) {
     //? glFenceSync 在gpu 命令流里插入标记
     //? GL_SYNC_GPU_COMMANDS_COMPLETE
-    // 在此之前的命令全部完成后触发,等gltexsubimage2D
+    // 在此之前的命令全部完成后触发,此时会等gltexsubimage2D
     screen_upload_fence[pboIndex] =
         glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
@@ -1537,11 +1466,36 @@ bool UpdateScreenTexture() {
   return true;
 }
 
-void RenderScreen_raw() {
+void RenderScreen_raw(MonitorSelector* selector) {
+  float x = (float)(selector->selected_screen_rect.Left - virtualLeft);
+  float yFromTop = (float)(selector->selected_screen_rect.Top - virtualTop);
+  float w = (float)selector->selected_screen_rect.Width;
+  float h = (float)selector->selected_screen_rect.Height;
+
+  float bottom = float(virtualHeight) - yFromTop - h;
+
+  // float vertices[] = {
+  //     x, y, 0, 0, 0,  // top left
+  //     x + w, 0, 0, 1, 0,  // top right
+  //     x, y + h, 0, 0, 1,  // bottom left
+  //     x + w, y + h, 0, 1, 1  // bottom right
+  // };
+  // clang-format off
+  float vertices[] = {
+      x,     bottom,     0, 0, 0, // 左下
+      x + w, bottom,     0, 1, 0, // 右下
+      x,     bottom + h, 0, 0, 1, // 左上
+      x + w, bottom + h, 0, 1, 1  // 右上
+  };
+  // clang-format on
+
   glUseProgram(shader_img);
 
-  glActiveTexture(GL_TEXTURE0);
   glBindVertexArray(screenVAO);
+  glBindBuffer(GL_ARRAY_BUFFER, screenVBO);
+  glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
+
+  glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, screen_texture);
 
   float cameraPos[2] = {camera.position.x, camera.position.y};

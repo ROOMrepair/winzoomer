@@ -56,8 +56,8 @@ class SystemCursorVisibility {
   }
 
  private:
-  using InitializeFunction = BOOL(WINAPI*)();
-  using ShowCursorFunction = BOOL(WINAPI*)(BOOL);
+  using InitializeFunction = WINBOOL(WINAPI*)();
+  using ShowCursorFunction = WINBOOL(WINAPI*)(WINBOOL);
 
   bool loadRuntime() {
     if (library_) return true;
