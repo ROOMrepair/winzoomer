@@ -147,7 +147,7 @@ class WGC_Capture {
 
   constexpr static int frameSize = 2;
   Request requested;
-  WGCCapturedFrame frames[2];
+  WGCCapturedFrame frames[frameSize];
   std::mutex lock;
   int ready = -1;
   int reading = -1;
