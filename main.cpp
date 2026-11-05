@@ -41,7 +41,7 @@
 #define TOGGLE_INPUT_HOTKEY_ID 2
 #define QUIT_KEY_ID2 3
 #define EXCHANGE_SCREEN 4
-#define PAN_KEY_FIRST 5 // 左、上、右、下，连续四个 ID
+#define PAN_KEY_FIRST 5  // 左、上、右、下，连续四个 ID
 
 #define BUF_SIZE 1024
 #define REFRESH_TIMER_ID 1
@@ -57,7 +57,7 @@
 #define radiusDeceleration 10.0
 #define dragFriction 6.0
 
-const wchar_t WIN_CLASS_NAME[] = _T("winzoomer_wcls0");
+const wchar_t WIN_CLASS_NAME[] = _T("winzoomer_wclass0");
 const wchar_t MUTEX_NAME[] = _T("winzoomer_mutex0");
 
 typedef struct FlashLight {
@@ -155,7 +155,6 @@ void SetInputPassthrough(bool enabledInputThrough);
 bool IsMouseInputMessage(UINT message);
 bool IsUserInputMessage(UINT message);
 
-
 void ShutdownCursorControl();
 
 void SetRealtimeMode(bool nextModeEnable, MonitorSelector* seletor);
@@ -172,13 +171,16 @@ void UnregisterPanHotkeys() {
 bool RegisterPanHotkeys() {
   const UINT keys[] = {VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN};
   for (int i = 0; i < 4; ++i) {
-    if (!RegisterHotKey(NULL, PAN_KEY_FIRST + i, MOD_CONTROL | MOD_ALT, keys[i])) {
+    if (!RegisterHotKey(NULL, PAN_KEY_FIRST + i, MOD_CONTROL | MOD_ALT,
+                        keys[i])) {
       const DWORD error = GetLastError();
       UnregisterPanHotkeys();
       char message[160]{};
       std::snprintf(message, sizeof(message),
-          "Could not register Ctrl+Alt+arrow shortcuts (error %lu).", error);
-      MessageBoxA(overlay, message, "Passthrough shortcut error", MB_OK | MB_ICONERROR);
+                    "Could not register Ctrl+Alt+arrow shortcuts (error %lu).",
+                    error);
+      MessageBoxA(overlay, message, "Passthrough shortcut error",
+                  MB_OK | MB_ICONERROR);
       return false;
     }
   }
@@ -186,7 +188,8 @@ bool RegisterPanHotkeys() {
 }
 
 void ApplyPassthroughPan(WPARAM hotkey) {
-  if (!useInputThroughWindow || hotkey < PAN_KEY_FIRST || hotkey >= PAN_KEY_FIRST + 4)
+  if (!useInputThroughWindow || hotkey < PAN_KEY_FIRST ||
+      hotkey >= PAN_KEY_FIRST + 4)
     return;
   const Vec2f directions[] = {{-1, 0}, {0, -1}, {1, 0}, {0, 1}};
   // 每次移动约 48 个显示像素，缩放后仍保持相同的操作步长。
@@ -246,7 +249,8 @@ void RenderFrame(float dt, float /*elapsed*/) {
   // mousepostarget 是在overlay上的坐标
 
   if (useInputThroughWindow) {
-    if (mouse_pos.x != keyboardPanMouse.x || mouse_pos.y != keyboardPanMouse.y) {
+    if (mouse_pos.x != keyboardPanMouse.x ||
+        mouse_pos.y != keyboardPanMouse.y) {
       keyboardPanning = false;
       keyboardPanRemaining = Vec2f(0, 0);
     }
@@ -286,17 +290,19 @@ void RenderFrame(float dt, float /*elapsed*/) {
   if (useInputThroughWindow && keyboardPanning) {
     // 按实际 dt 缓动，约 0.17 秒完成 95%；剩余量独立于缩放的支点调整。
     const float blend = keyboardPanRemaining.length() * camera.scale < 0.1f
-                            ? 1.0f : 1.0f - std::exp(-18.0f * dt);
+                            ? 1.0f
+                            : 1.0f - std::exp(-18.0f * dt);
     const Vec2f step = keyboardPanRemaining * blend;
     camera.position += step;
     keyboardPanRemaining -= step;
   }
   // 使用本帧更新后的相机，与桌面纹理保持同一变换，避免缩放时光标滞后一帧。
-  if (useInputThroughWindow) mouse_pos_client = CaptureToOverlayPoint(mouse_pos_target);
+  if (useInputThroughWindow)
+    mouse_pos_client = CaptureToOverlayPoint(mouse_pos_target);
 
   POINT viewPortLT = OverlayToCapturePoint(POINT{0, 0});
-  POINT viewPortRB = OverlayToCapturePoint(
-      POINT{virtualWidth - 1, virtualHeight - 1});
+  POINT viewPortRB =
+      OverlayToCapturePoint(POINT{virtualWidth - 1, virtualHeight - 1});
 
   // mouse_pos_target 已经 ScreenToClient，视口也转换为虚拟桌面局部坐标。
   overlayViewPort.left = viewPortLT.x - virtualLeft;
@@ -319,14 +325,16 @@ void RenderFrame(float dt, float /*elapsed*/) {
       PostQuitMessage(1);
       return;
     }
-    MessageBoxA(overlay, error.c_str(), "WGC capture error", MB_OK | MB_ICONERROR);
+    MessageBoxA(overlay, error.c_str(), "WGC capture error",
+                MB_OK | MB_ICONERROR);
   }
 
   RenderBegin();
   RenderScreen_raw();
 
   if (flashLight.isEnabled) {
-    const POINT samplePos = useInputThroughWindow ? mouse_pos : mouse_pos_target;
+    const POINT samplePos =
+        useInputThroughWindow ? mouse_pos : mouse_pos_target;
     const bool pixelValid = ReadScreenPixel(samplePos, pixel);
     if (!pixelValid) std::memset(pixel, 0, sizeof(pixel));
 #ifdef FREETYPE
@@ -341,15 +349,15 @@ void RenderFrame(float dt, float /*elapsed*/) {
       renderer.DrawText(text, 25, 20, red, green, blue);
       std::swprintf(text, 128, L"HEX: #%02X%02X%02X", r, g, b);
       renderer.DrawText(text, 25, 52, red, green, blue);
-      std::swprintf(text, 128, L"HSV: (%.0f\u00B0, %.0f%%, %.0f%%)", h, s * 100, v * 100);
+      std::swprintf(text, 128, L"HSV: (%.0f\u00B0, %.0f%%, %.0f%%)", h, s * 100,
+                    v * 100);
       renderer.DrawText(text, 25, 84, red, green, blue);
-    } else {
-      renderer.DrawText(L"Color: N/A", 25, 20, 1, 1, 1);
     }
 #endif
   }
   // 与原版一样，最后绘制光标，位置和尺寸不受相机缩放影响。
-  if (!renderer.DrawCursor(float(mouse_pos_client.x), float(mouse_pos_client.y))) {
+  if (!renderer.DrawCursor(float(mouse_pos_client.x),
+                           float(mouse_pos_client.y))) {
     OutputDebugStringA("winzoomer: D3D cursor draw failed\n");
     PostQuitMessage(1);
   }
@@ -510,8 +518,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   frameInterval = (float)1 / FPS;
 
   if (!renderer.Initialize(overlay, virtualWidth, virtualHeight)) {
-    MessageBoxA(overlay, renderer.LastError().c_str(), "D3D initialization error",
-                MB_OK | MB_ICONERROR);
+    MessageBoxA(overlay, renderer.LastError().c_str(),
+                "D3D initialization error", MB_OK | MB_ICONERROR);
     DestroyWindow(overlay);
     return 1;
   }
@@ -523,13 +531,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   } else if (!singleScreenCapture.capture(displayedScreenRect.Left,
                                           displayedScreenRect.Top)) {
     startupError = "Failed to capture the desktop using GDI.";
-  } else if (!ReLoadTextureSize(displayedScreenRect, singleScreenCapture.pixels)) {
+  } else if (!ReLoadTextureSize(displayedScreenRect,
+                                singleScreenCapture.pixels)) {
     startupError = "Failed to prepare or upload the D3D screenshot.\n";
     startupError += renderer.LastError();
   }
   if (!startupError.empty()) {
-    MessageBoxA(overlay, startupError.c_str(), "Error",
-                MB_OK | MB_ICONERROR);
+    MessageBoxA(overlay, startupError.c_str(), "Error", MB_OK | MB_ICONERROR);
     singleScreenCapture.shutdown();
     renderer.Shutdown();
     DestroyWindow(overlay);
@@ -538,8 +546,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
 #ifdef FREETYPE
   if (!renderer.InitializeText()) {
-    MessageBoxA(overlay, renderer.LastError().c_str(), "D3D text initialization error",
-                MB_OK | MB_ICONERROR);
+    MessageBoxA(overlay, renderer.LastError().c_str(),
+                "D3D text initialization error", MB_OK | MB_ICONERROR);
     singleScreenCapture.shutdown();
     renderer.Shutdown();
     DestroyWindow(overlay);
@@ -786,16 +794,18 @@ void SetInputPassthrough(bool enabledInputThrough) {
     applied = SetLayeredWindowAttributes(overlay, 0, 255, LWA_ALPHA) != FALSE;
   if (applied)
     applied = SetWindowPos(overlay, HWND_TOPMOST, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED) != FALSE;
+                           SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                               SWP_FRAMECHANGED) != FALSE;
   if (!applied) {
     const DWORD error = GetLastError();
     SetWindowLongPtr(overlay, GWL_EXSTYLE, previousStyle);
     SetWindowPos(overlay, HWND_TOPMOST, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     ShutdownCursorControl();
     char message[128]{};
     std::snprintf(message, sizeof(message),
-                  "Could not change passthrough window style (error %lu).", error);
+                  "Could not change passthrough window style (error %lu).",
+                  error);
     PostQuitMessage(1);
     MessageBoxA(overlay, message, "Passthrough error", MB_OK | MB_ICONERROR);
     return;
@@ -1054,10 +1064,10 @@ bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba) {
   if (singleScreenCapture.pixels == nullptr) return false;
   // OverlayToCapturePoint returns absolute desktop coordinates. Convert them
   // to image-local coordinates, including negative multi-monitor origins.
-  const long long x = static_cast<long long>(desktopPos.x) -
-                      displayedScreenRect.Left;
-  const long long y = static_cast<long long>(desktopPos.y) -
-                      displayedScreenRect.Top;
+  const long long x =
+      static_cast<long long>(desktopPos.x) - displayedScreenRect.Left;
+  const long long y =
+      static_cast<long long>(desktopPos.y) - displayedScreenRect.Top;
   if (x < 0 || y < 0 || x >= singleScreenCapture.width ||
       y >= singleScreenCapture.height) {
     return false;
@@ -1112,19 +1122,22 @@ void RGBtoHSV(int r, int g, int b, float& h, float& s, float& v) {
 bool ReLoadTextureSize(const ScreenRect& rect, const void* pixels) {
   if (!pixels || rect.Width <= 0 || rect.Height <= 0 ||
       rect.Width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
-      rect.Height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) return false;
+      rect.Height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+    return false;
   const size_t rowBytes = static_cast<size_t>(rect.Width) * 4;
   try {
     std::vector<unsigned char> topDown(rowBytes * rect.Height);
     const auto* bottomUp = static_cast<const unsigned char*>(pixels);
     for (int y = 0; y < rect.Height; ++y) {
-      std::memcpy(topDown.data() + static_cast<size_t>(y) * rowBytes,
-                  bottomUp + static_cast<size_t>(rect.Height - 1 - y) * rowBytes,
-                  rowBytes);
+      std::memcpy(
+          topDown.data() + static_cast<size_t>(y) * rowBytes,
+          bottomUp + static_cast<size_t>(rect.Height - 1 - y) * rowBytes,
+          rowBytes);
     }
     return renderer.SetScreenImage(rect.Width, rect.Height, topDown.data());
   } catch (const std::exception&) {
-    OutputDebugStringA("winzoomer: failed to allocate screenshot upload buffer\n");
+    OutputDebugStringA(
+        "winzoomer: failed to allocate screenshot upload buffer\n");
     return false;
   }
 }
@@ -1133,13 +1146,13 @@ void SetRealtimeMode(bool nextModeEnable, MonitorSelector* selector) {
   if (nextModeEnable == useRealTime || !selector) return;
   if (nextModeEnable) {
     if (!wgcDevice.Initialize(renderer.Device())) {
-      MessageBoxA(overlay, wgcDevice.LastError().c_str(), "WGC initialization error",
-                  MB_OK | MB_ICONERROR);
+      MessageBoxA(overlay, wgcDevice.LastError().c_str(),
+                  "WGC initialization error", MB_OK | MB_ICONERROR);
       return;
     }
     if (!realtimeCapture.Start(wgcDevice, overlay, *selector)) {
-      MessageBoxA(overlay, realtimeCapture.LastError().c_str(), "WGC start error",
-                  MB_OK | MB_ICONERROR);
+      MessageBoxA(overlay, realtimeCapture.LastError().c_str(),
+                  "WGC start error", MB_OK | MB_ICONERROR);
       return;
     }
   } else {
@@ -1147,9 +1160,10 @@ void SetRealtimeMode(bool nextModeEnable, MonitorSelector* selector) {
     if (useInputThroughWindow) SetInputPassthrough(false);
     // 冻结的是当前显示的桌面纹理，而不是重新截取桌面；只在此处读回。
     if (!renderer.ReadScreenImage(singleScreenCapture.pixels,
-                                  singleScreenCapture.width, singleScreenCapture.height)) {
-      MessageBoxA(overlay, renderer.LastError().c_str(), "Freeze screenshot error",
-                  MB_OK | MB_ICONERROR);
+                                  singleScreenCapture.width,
+                                  singleScreenCapture.height)) {
+      MessageBoxA(overlay, renderer.LastError().c_str(),
+                  "Freeze screenshot error", MB_OK | MB_ICONERROR);
       return;
     }
     realtimeCapture.Stop();
@@ -1158,12 +1172,11 @@ void SetRealtimeMode(bool nextModeEnable, MonitorSelector* selector) {
 }
 
 void RenderScreen_raw() {
-  if (!renderer.DrawScreen(
-          float(displayedScreenRect.Left - virtualLeft),
-          float(displayedScreenRect.Top - virtualTop),
-          camera.position.x, camera.position.y, camera.scale,
-          float(mouse_pos_client.x), float(mouse_pos_client.y),
-          flashLight.radius, flashLight.shadow)) {
+  if (!renderer.DrawScreen(float(displayedScreenRect.Left - virtualLeft),
+                           float(displayedScreenRect.Top - virtualTop),
+                           camera.position.x, camera.position.y, camera.scale,
+                           float(mouse_pos_client.x), float(mouse_pos_client.y),
+                           flashLight.radius, flashLight.shadow)) {
     OutputDebugStringA("winzoomer: D3D screen draw failed\n");
     PostQuitMessage(1);
   }

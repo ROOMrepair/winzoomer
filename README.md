@@ -18,6 +18,8 @@ https://github.com/tsoding/boomer 的一个可能的 windows 版本
 |取色(RGB模式)|<kbd>C</kbd>|
 | 实时画面|<kbd>U</kbd>|
 | 穿透模式 (danger!!) |<kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>F11</kbd>|
+|切换屏幕(多屏)|<kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>F10</kbd>|
+|穿透模式移动窗口|<kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>方向键</kbd>|
 | 穿透模式下缩放画面|<kbd>Shift</kbd> + <kbd>滚轮</kbd>|
 
 ## 系统光标恢复
