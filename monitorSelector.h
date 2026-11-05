@@ -27,6 +27,7 @@ struct MonitorSelector {
   std::vector<HMONITOR> monitors;
   std::vector<MONITORINFOEXW> monitor_infos;
 
+
   // selected_monitor < 0 || selected_monitor >= size use full screen
   size_t selected_monitor = -1;
 

@@ -6,7 +6,7 @@
 #include <atomic>
 #include <cstddef>
 #include <stdexcept>
-#include "monitor_selector.h"
+#include "monitorSelector.h"
 
 struct ScreenCaptureBuffer {
   int width = 0;
@@ -122,7 +122,6 @@ struct RealtimeCapture {
 
   bool previousSelectedState = false;
   bool isFirstFrame = true;
-
 
   bool initialized = false;
   int ready = -1;

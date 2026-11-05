@@ -1,6 +1,6 @@
 #pragma once
 
-#include "system_cursor.h"
+#include "systemCursor.h"
 #include <cstdint>
 #include <cwchar>
 #include <string>
@@ -101,11 +101,11 @@ class CursorRecoveryWatchdog {
     HANDLE handles[] = {parent.get(), ready.get(), armed_.get(), cancel_.get()};
     PROCESS_INFORMATION child{};
     //? 向属性列表添加属性(handles)
-    const BOOL configured = UpdateProcThreadAttribute(
+    const WINBOOL configured = UpdateProcThreadAttribute(
         startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles,
         sizeof(handles), NULL, NULL);
 
-    const BOOL created = configured && CreateProcessW(
+    const WINBOOL created = configured && CreateProcessW(
         executable.data(), writableCommand.data(), NULL, NULL, TRUE,
         CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
         &startup.StartupInfo, &child);

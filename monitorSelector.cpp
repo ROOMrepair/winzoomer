@@ -1,5 +1,4 @@
-#include "monitor_selector.h"
-#include <handleapi.h>
+#include "monitorSelector.h"
 
 BOOL CALLBACK CollectMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
   auto& monitors = *reinterpret_cast<std::vector<HMONITOR>*>(data);

@@ -19,13 +19,14 @@
 #include <math.h>
 #include <ShellScalingApi.h>
 
-#include "monitor_selector.h"
+#include "monitorSelector.h"
 #include "simpleMath.h"
 #include "simpleText.h"
 #include "simpleShader.h"
-#include "system_cursor.h"
-#include "cursor_recovery.h"
+#include "systemCursor.h"
+#include "cursorRecovery.h"
 #include "screenCapture.h"
+#include "wgcCapture.h"
 
 #include <glad/glad.h>
 #include <winnt.h>
@@ -46,7 +47,7 @@
 
 #define VELOCITY_THRESHOLD 15.0
 #define INITIAL_FL_DELTA_RADIUS 250.0
-#define OverlayViewPortMoveSpeed 1.2
+#define OverlayViewPortMoveSpeed 0.8
 #define wheelScale 0.005
 #define scaleFriction 3.0
 #define velocity_movement 60.0
@@ -139,8 +140,9 @@ GLuint cursor_vbo, cursor_vao;
 unsigned char pixel[4];
 
 ScreenCaptureBuffer singleScreenCapture;  // for frozen image
-RealtimeCapture realtimeCapture;
 MonitorSelector monitorSeletor;
+WGC_Capture realtimeCapture;
+ScreenRect displayedScreenRect{};
 
 SystemCursorVisibility systemCursor;
 CursorRecoveryWatchdog cursorRecovery;
@@ -152,8 +154,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
 void RGBtoHSV(int r, int g, int b, float& h, float& s, float& v);
 bool ReadScreenPixel(const POINT& desktopPos, unsigned char* rgba);
-bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba,
-                          MonitorSelector* seletor);
+bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba);
 bool ReadDesktopPixel(const POINT& desktopPos, unsigned char* rgba);
 bool CacheFrozenScreenTexture();
 
@@ -173,50 +174,37 @@ bool UpdateScreenTexture();
 bool InitializeScreenUploadPbos(int width, int height);
 void ReconfigureScreenUploadPbos(int width, int height);
 void ShutdownScreenUploadPbos();
-void ReLoadTextureSize(MonitorSelector* selector, void* pixels);
+void ReLoadTextureSize(const ScreenRect& rect, const void* pixels);
 
 bool IsInsideRect(const RECT& rect, const POINT& src);
 
-void RenderScreen_raw(MonitorSelector* selector);
+void RenderScreen_raw();
 void RenderCursor(POINT renderPos);
 
-/*!
-   调用这个
-   mainproc 切换显示, cost some time & render freeze
-   set resetevent (这里还要加内容需要等待内部load结束)
-   只在realtime启动时生效
- */
 bool RebuildRenderScreen(MonitorSelector* seletor, size_t to_select) {
   if (!seletor) return false;
 
+  const size_t previous = seletor->selected_monitor;
   seletor->SelectMonitor(to_select);
+  if (useRealTime) {
+    realtimeCapture.SetCapture(true, seletor->selected_monitor);
+    return true;
+  }
 
+  const ScreenRect rect = seletor->selected_screen_rect;
+  ScreenCaptureBuffer next;
+  if (!next.setup(rect.Width, rect.Height) ||
+      !next.capture(rect.Left, rect.Top)) {
+    next.shutdown();
+    seletor->SelectMonitor(previous);
+    return false;
+  }
+  ReLoadTextureSize(rect, next.pixels);
   singleScreenCapture.shutdown();
-  singleScreenCapture.setup(seletor->selected_screen_rect.Width,
-                            seletor->selected_screen_rect.Height);
-  singleScreenCapture.capture(seletor->selected_screen_rect.Left,
-                              seletor->selected_screen_rect.Top);
-  ReLoadTextureSize(&monitorSeletor, (void*)singleScreenCapture.pixels);
-
-  realtimeCapture.setEnabled(false);
-  realtimeCapture.setLoadEvent();
-
-  realtimeCapture.reading = -1;
-  realtimeCapture.ready = -1;
-  /*! 设置为-1 为了能够在UpdateScreenTexture中提前返回,
-      但是此时realcap线程可能没有进入wait,
-      然后重新修改了reading ready
-      但是UpdateScreenTexture已经通过load限制了,所以应该没问题
-  */
-
-  ReconfigureScreenUploadPbos(seletor->selected_screen_rect.Width,
-                              seletor->selected_screen_rect.Height);
-
+  singleScreenCapture = next;
+  displayedScreenRect = rect;
   screen_mipmaps_dirty = true;
-  ConfigureScreenTextureFilter(useRealTime);
-
-  realtimeCapture.isFirstFrame = true;
-
+  ConfigureScreenTextureFilter(false);
   return true;
 }
 
@@ -288,7 +276,7 @@ void RenderFrame(float dt, float elapsed) {
   }
 
   RenderBegin();
-  RenderScreen_raw(&monitorSeletor);
+  RenderScreen_raw();
 
   if (flashLight.isEnabled) {
 #ifdef FREETYPE
@@ -465,6 +453,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                 MB_OK | MB_ICONERROR);
     return 1;
   }
+  displayedScreenRect = monitorSeletor.selected_screen_rect;
 
   overlayViewPort.left = virtualLeft;
   overlayViewPort.top = virtualTop;
@@ -512,7 +501,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   // Normal mode continues to use WM_MOUSEWHEEL; only passthrough uses WM_INPUT.
   RAWINPUTDEVICE mouseDevice{0x01, 0x02, RIDEV_INPUTSINK, overlay};
   if (!RegisterRawInputDevices(&mouseDevice, 1, sizeof(mouseDevice))) {
-    MessageBoxW(overlay, L"Could not register mouse Raw Input.", L"Error",
+    MessageBoxA(overlay, "Could not register mouse Raw Input.", "Error",
                 MB_OK | MB_ICONERROR);
     DestroyWindow(overlay);
     return 1;
@@ -554,40 +543,50 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
   g_glrc = wglCreateContext(g_hdc);
   if (g_glrc == NULL || g_hdc == NULL) {
-    MessageBoxA(NULL, "failed to create glContext", "Error",
+    MessageBoxA(overlay, "failed to create glContext", "Error",
                 MB_OK | MB_ICONERROR);
+
+    DestroyWindow(overlay);
     return 1;
   }
 
   wglMakeCurrent(g_hdc, g_glrc);
 
   if (!gladLoadGL()) {
-    MessageBoxA(NULL, "failed to run gladLoadGL", "Error",
+    MessageBoxA(overlay, "failed to run gladLoadGL", "Error",
                 MB_OK | MB_ICONERROR);
+
+    DestroyWindow(overlay);
     return 1;
   }
 
   // shader
   shader_img = createShader(vertexShader, fragmentShader);
   if (shader_img == 0) {
+    DestroyWindow(overlay);
     return 1;
   }
 
   shader_cursor = createShader(cursorVertShader, cursorFragShader);
   if (shader_cursor == 0) {
+    DestroyWindow(overlay);
     return 1;
   }
 
   if (!singleScreenCapture.setup(virtualWidth, virtualHeight) ||
       !singleScreenCapture.capture(virtualLeft, virtualTop)) {
-    MessageBoxA(NULL, "failed to capture the virtual screen", "Error",
+    MessageBoxA(overlay, "failed to capture the virtual screen", "Error",
                 MB_OK | MB_ICONERROR);
     singleScreenCapture.shutdown();
+    DestroyWindow(overlay);
     return 1;
   }
 
 #ifdef FREETYPE
-  if (!InitFreetype()) return 1;
+  if (!InitFreetype()) {
+    DestroyWindow(overlay);
+    return 1;
+  }
 #endif  // FREETYPE
 
   unsigned int indices[] = {0, 1, 2, 1, 2, 3};
@@ -668,7 +667,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     UnregisterHotKey(NULL, EXCHANGE_SCREEN);
     UnregisterHotKey(NULL, TOGGLE_INPUT_HOTKEY_ID);
 
-    realtimeCapture.stop();
+    realtimeCapture.Stop();
     singleScreenCapture.shutdown();
 
     glDeleteBuffers(1, &screenVBO);
@@ -683,6 +682,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     wglMakeCurrent(NULL, NULL);
     wglDeleteContext(g_glrc);
     ReleaseDC(overlay, g_hdc);
+    DestroyWindow(overlay);
+
     running = false;
   };
 
@@ -824,20 +825,20 @@ bool IsUserInputMessage(UINT message) {
 void SetInputPassthrough(bool enabledInputThrough) {
   //! arm 启动子进程
   if (enabledInputThrough && !cursorRecovery.arm()) {
-    MessageBoxW(overlay,
-                L"Could not start the cursor recovery process. Passthrough "
-                L"mode was not enabled, so the system cursor remains visible.",
-                L"Cursor recovery", MB_OK | MB_ICONERROR);
+    MessageBoxA(overlay,
+                "Could not start the cursor recovery process. Passthrough "
+                "mode was not enabled, so the system cursor remains visible.",
+                "Cursor recovery", MB_OK | MB_ICONERROR);
     return;
   }
   if (!systemCursor.setHidden(enabledInputThrough)) {
-    MessageBoxW(overlay,
+    MessageBoxA(overlay,
                 enabledInputThrough
-                    ? L"Could not hide the system cursor. Passthrough mode "
-                      L"was not enabled."
-                    : L"Could not restore the system cursor. The application "
-                      L"will retry during shutdown.",
-                L"Magnification API", MB_OK | MB_ICONERROR);
+                    ? "Could not hide the system cursor. Passthrough mode "
+                      "was not enabled."
+                    : "Could not restore the system cursor. The application "
+                      "will retry during shutdown.",
+                "Magnification API", MB_OK | MB_ICONERROR);
     if (enabledInputThrough) {
       return;
     }
@@ -1121,15 +1122,14 @@ bool ReadDesktopPixel(const POINT& desktopPos, unsigned char* rgba) {
   return true;
 }
 
-bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba,
-                          MonitorSelector* seletor) {
+bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba) {
   if (singleScreenCapture.pixels == nullptr) return false;
   // OverlayToCapturePoint returns absolute desktop coordinates. Convert them
   // to image-local coordinates, including negative multi-monitor origins.
   const long long x = static_cast<long long>(desktopPos.x) -
-                      monitorSeletor.selected_screen_rect.Left;
+                      displayedScreenRect.Left;
   const long long y = static_cast<long long>(desktopPos.y) -
-                      monitorSeletor.selected_screen_rect.Top;
+                      displayedScreenRect.Top;
   if (x < 0 || y < 0 || x >= singleScreenCapture.width ||
       y >= singleScreenCapture.height) {
     return false;
@@ -1151,11 +1151,21 @@ bool ReadFrozenImagePixel(const POINT& desktopPos, unsigned char* rgba,
 // desktop 指实际的桌面坐标
 bool ReadScreenPixel(const POINT& desktopPos, unsigned char* rgba) {
   return useRealTime ? ReadDesktopPixel(desktopPos, rgba)
-                     : ReadFrozenImagePixel(desktopPos, rgba, &monitorSeletor);
+                     : ReadFrozenImagePixel(desktopPos, rgba);
 }
 
 // 直接取当前的capturesize,capturesize 只在rebuild变化
 bool CacheFrozenScreenTexture() {
+  if (singleScreenCapture.width != displayedScreenRect.Width ||
+      singleScreenCapture.height != displayedScreenRect.Height ||
+      !singleScreenCapture.pixels) {
+    singleScreenCapture.shutdown();
+    if (!singleScreenCapture.setup(displayedScreenRect.Width,
+                                   displayedScreenRect.Height)) {
+      singleScreenCapture.shutdown();
+      return false;
+    }
+  }
   GLint previousTexture = 0, previousPackBuffer = 0;
 
   //? 查询当前活动单元glActiveTexture使用纹理
@@ -1191,7 +1201,7 @@ bool CacheFrozenScreenTexture() {
     singleScreenCapture.shutdown();
     OutputDebugStringA(
         "winzoomer: failed to cache frozen image for color picking\n");
-    MessageBoxA(NULL,
+    MessageBoxA(overlay,
                 "winzoomer: failed to cache frozen image for color picking",
                 "Error", MB_OK | MB_ICONERROR);
     return false;
@@ -1224,12 +1234,12 @@ void RGBtoHSV(int r, int g, int b, float& h, float& s, float& v) {
   v = maxv;
 }
 
-void ReLoadTextureSize(MonitorSelector* selector, void* pixels) {
+void ReLoadTextureSize(const ScreenRect& rect, const void* pixels) {
   GLint previousTexture = 0;
   glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);  // 名称
   glBindTexture(GL_TEXTURE_2D, screen_texture);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, selector->selected_screen_rect.Width,
-               selector->selected_screen_rect.Height, 0, GL_BGRA,
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rect.Width,
+               rect.Height, 0, GL_BGRA,
                GL_UNSIGNED_BYTE, pixels);
 
   glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
@@ -1256,39 +1266,22 @@ void ConfigureScreenTextureFilter(bool useRealtime) {
 }
 
 void SetRealtimeMode(bool nextModeEnable, MonitorSelector* selector) {
-  if (nextModeEnable && !realtimeCapture.start(selector)) {
-    OutputDebugStringA("winzoomer: failed to start realtime capture\n");
+  if (nextModeEnable == useRealTime) return;
+  if (nextModeEnable && !realtimeCapture.Start(overlay, selector)) {
+    OutputDebugStringA("winzoomer: failed to start WGC worker\n");
     return;
   }
 
-  // 第一次 userealtime InitializeScreenUploadPbos
-  if (nextModeEnable && !screen_upload_pbo[0]) {
-    if (!InitializeScreenUploadPbos(selector->selected_screen_rect.Width,
-                                    selector->selected_screen_rect.Height)) {
-      OutputDebugStringA(
-          "winzoomer: failed to start realtime capture when "
-          "InitializeScreenUploadPbos\n");
-      return;
+  realtimeCapture.SetCapture(nextModeEnable, selector->selected_monitor);
+  ConfigureScreenTextureFilter(nextModeEnable);
+  useRealTime = nextModeEnable;
+  if (nextModeEnable) {
+    if (!screen_upload_pbo[0]) {
+      InitializeScreenUploadPbos(displayedScreenRect.Width,
+                                 displayedScreenRect.Height);
     }
-  }
-
-  if (nextModeEnable == useRealTime) {
-    return;
-  }
-
-  // 当前是realtime,接下来取消, 截取一张图
-  if (!nextModeEnable && useRealTime) {
-    realtimeCapture.setEnabled(false);
-    ConfigureScreenTextureFilter(false);
+  } else {
     CacheFrozenScreenTexture();
-    useRealTime = false;
-    return;
-  }
-
-  if (nextModeEnable && !useRealTime) {
-    realtimeCapture.setEnabled(true);
-    ConfigureScreenTextureFilter(nextModeEnable);
-    useRealTime = true;
   }
 }
 
@@ -1342,7 +1335,7 @@ void ReconfigureScreenUploadPbos(int width, int height) {
   if (!pbo_inited) return;
 
   for (int i = 0; i < 2; ++i) {
-    glDeleteSync(screen_upload_fence[i]);
+    if (screen_upload_fence[i]) glDeleteSync(screen_upload_fence[i]);
     screen_upload_fence[i] = nullptr;
   }
 
@@ -1369,15 +1362,17 @@ void ReconfigureScreenUploadPbos(int width, int height) {
   }
 }
 
-/*! 这里要确保selector, realcap buffer, singlecap buffer, pbo 一致
-    selector: rebuild 同步
-    singlecap buffer 同步
-    pbo 同步
-    realcap buffer 异步，完成后 isloading = false
-    放行
-*/
-bool UpdateScreenTexture() {
-  if (realtimeCapture.isLoading.load()) return true;
+enum class ScreenUploadResult { Uploaded, Busy, Failed };
+
+static ScreenUploadResult UploadScreenFrame(const WGCCapturedFrame& frame) {
+  const ScreenRect& rect = frame.rect;
+  if (rect.Width <= 0 || rect.Height <= 0) return ScreenUploadResult::Failed;
+  const size_t bytes = static_cast<size_t>(rect.Width) * rect.Height * 4;
+  if (frame.pixels.size() != bytes) return ScreenUploadResult::Failed;
+  if (screen_upload_pbo[0] && screen_upload_bytes != bytes) {
+    ReconfigureScreenUploadPbos(rect.Width, rect.Height);
+  }
+
   int pboIndex = -1;
   if (screen_upload_pbo[0]) {
     for (int offset = 0; offset < 2; ++offset) {
@@ -1397,13 +1392,10 @@ bool UpdateScreenTexture() {
       pboIndex = i;
       break;
     }
-    if (screen_upload_pbo[0] && pboIndex < 0) return false;
+    if (screen_upload_pbo[0] && pboIndex < 0) return ScreenUploadResult::Busy;
   }
 
-  const int frame = realtimeCapture.acquireLatest();
-  if (frame < 0) return false;
-
-  const unsigned char* pixels = realtimeCapture.buffers[frame].pixels;
+  const unsigned char* pixels = frame.pixels.data();
   bool staged = false;
 
   if (pboIndex >= 0) {
@@ -1426,26 +1418,16 @@ bool UpdateScreenTexture() {
     }
   }
 
-  //? 提交 pbo 只是发送纹理的更新请求, 说明这里glTexSubImage2D 异步
-  //? 这一过程中当前 pbo 会被占用
-  //? glTexSubImage2D 不会删除原来的texture,如果之前是 3000 * 2000,接下来是 2000
-  //* 1000, ? 多余的部分还是存在于 texture 内存空间,此时用 glTexImage2D,
-  // 重新分配一下
-  //+ 最好将 glTexImage2D 单独抽出来  use nullptr 在 single 和 real cap
-  // 之前就设置好
   glBindTexture(GL_TEXTURE_2D, screen_texture);
-  if (realtimeCapture.isFirstFrame) {
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
-                 monitorSeletor.selected_screen_rect.Width,
-                 monitorSeletor.selected_screen_rect.Height, 0, GL_BGRA,
+  if (rect.Width != displayedScreenRect.Width ||
+      rect.Height != displayedScreenRect.Height) {
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rect.Width, rect.Height, 0, GL_BGRA,
                  GL_UNSIGNED_BYTE, staged ? nullptr : pixels);
-    realtimeCapture.isFirstFrame = false;
   } else {
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-                    monitorSeletor.selected_screen_rect.Width,
-                    monitorSeletor.selected_screen_rect.Height, GL_BGRA,
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, rect.Width, rect.Height, GL_BGRA,
                     GL_UNSIGNED_BYTE, staged ? nullptr : pixels);
   }
+  const GLenum uploadError = glGetError();
   if (staged) {
     //? glFenceSync 在gpu 命令流里插入标记
     //? GL_SYNC_GPU_COMMANDS_COMPLETE
@@ -1459,18 +1441,34 @@ bool UpdateScreenTexture() {
       screen_upload_pbo_index = (pboIndex + 1) % 2;
     }
   }
-  realtimeCapture.release();
-
-  screen_mipmaps_dirty = true;
   glBindTexture(GL_TEXTURE_2D, 0);
-  return true;
+  if (uploadError != GL_NO_ERROR) {
+    OutputDebugStringA("winzoomer: WGC texture upload failed\n");
+    return ScreenUploadResult::Failed;
+  }
+  displayedScreenRect = rect;
+  screen_mipmaps_dirty = true;
+  return ScreenUploadResult::Uploaded;
 }
 
-void RenderScreen_raw(MonitorSelector* selector) {
-  float x = (float)(selector->selected_screen_rect.Left - virtualLeft);
-  float yFromTop = (float)(selector->selected_screen_rect.Top - virtualTop);
-  float w = (float)selector->selected_screen_rect.Width;
-  float h = (float)selector->selected_screen_rect.Height;
+bool UpdateScreenTexture() {
+  if (realtimeCapture.TakeFailure()) {
+    SetRealtimeMode(false, &monitorSeletor);
+    return false;
+  }
+  const auto* frame = realtimeCapture.AcquireLatest();
+  if (!frame) return false;
+  const auto result = UploadScreenFrame(*frame);
+  // pboIndex = -1 fence 未完成
+  realtimeCapture.ReleaseFrame(result == ScreenUploadResult::Busy);
+  return result == ScreenUploadResult::Uploaded;
+}
+
+void RenderScreen_raw() {
+  float x = (float)(displayedScreenRect.Left - virtualLeft);
+  float yFromTop = (float)(displayedScreenRect.Top - virtualTop);
+  float w = (float)displayedScreenRect.Width;
+  float h = (float)displayedScreenRect.Height;
 
   float bottom = float(virtualHeight) - yFromTop - h;
 
